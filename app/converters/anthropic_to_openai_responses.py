@@ -77,19 +77,56 @@ class AnthropicToOpenAIResponsesConverter:
             if value is not None:
                 result[field] = value
 
-        if request.thinking is not None and is_thinking_enabled(request.thinking):
-            result["reasoning"] = {
-                "effort": AnthropicToOpenAIConverter()._convert_thinking_to_effort(
+        # reasoning.effort 来自两种客户端约定，按优先级取第一个命中的：
+        #   1. output_config.effort：客户端直接命名档位，可达完整 none..max 区间。
+        #   2. thinking.budget_tokens：旧约定，按配置的 token 阈值映射到 low/medium/high。
+        # 取到的档位再 clamp 到该模型族实际支持的上限——Mantle 对不支持的 effort 直接拒绝请求。
+        effort: str | None = None
+        if isinstance(request.output_config, dict):
+            candidate = request.output_config.get("effort")
+            if isinstance(candidate, str) and candidate:
+                effort = candidate
+        if effort is None:
+            if request.thinking is not None and is_thinking_enabled(request.thinking):
+                effort = AnthropicToOpenAIConverter()._convert_thinking_to_effort(
                     request.thinking
                 )
-            }
-        elif (
-            request.thinking is not None and request.thinking.get("type") == "disabled"
+            elif (
+                request.thinking is not None
+                and request.thinking.get("type") == "disabled"
+            ):
+                effort = "none"
+        if effort:
+            result["reasoning"] = {"effort": effort}
+            # 局部导入：该模块的包 __init__ 会拉起 passthrough router，模块级导入会让
+            # 核心 /v1/messages 转换器在加载期就耦合整条链路。
+            from app.api.openai_passthrough.chat_responses_adapter import (
+                clamp_reasoning_effort,
+            )
+
+            clamp_reasoning_effort(result)
+
+        # reasoning.summary 是 opt-in：仅当客户端通过 thinking.display == "summarized"
+        # 明确要 reasoning 文本时才请求 "auto"，缺省则保持隐藏。是否支持因模型而异且无法
+        # 从任何已发布清单枚举，故这里不加模型门禁直接透传——不支持的模型会自行拒绝该请求，
+        # 与 effort 一样信任调用方。
+        if (
+            isinstance(request.thinking, dict)
+            and request.thinking.get("display") == "summarized"
         ):
-            result["reasoning"] = {"effort": "none"}
-        # Responses has no stop/stop_sequences parameter. Do not forward it or
-        # top_k. Omit the optional reasoning.summary parameter for broader model
-        # compatibility, while preserving any summaries returned by the model.
+            # 合并进 effort 可能已填充的 reasoning dict。
+            reasoning = result.get("reasoning")
+            if not isinstance(reasoning, dict):
+                reasoning = {}
+                result["reasoning"] = reasoning
+            reasoning["summary"] = "auto"
+
+        # text.verbosity 控制最终回答长度；仅当客户端在 output_config 里显式命名时透传，缺省不注入。
+        if isinstance(request.output_config, dict):
+            verbosity = request.output_config.get("verbosity")
+            if isinstance(verbosity, str) and verbosity:
+                result["text"] = {"verbosity": verbosity}
+        # Responses has no stop/stop_sequences parameter. Do not forward it or top_k.
 
         return result
 

@@ -16,6 +16,10 @@ export interface DashboardStats {
   total_cached_tokens: number;
   total_cache_write_tokens: number;
   total_requests: number;
+  // Anthropic-attributed subset of the totals above — see ApiKey type.
+  anthropic_input_tokens: number;
+  anthropic_cached_tokens: number;
+  anthropic_cache_write_tokens: number;
 }
 
 export interface DailyModelUsage {

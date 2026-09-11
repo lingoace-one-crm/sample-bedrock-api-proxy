@@ -27,6 +27,12 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
 
 WORKDIR /build
 
+# Increase HTTP timeout for dependency downloads (matches root Dockerfile);
+# default 30s is too short for larger wheels (grpcio, cryptography, botocore)
+# on flaky networks.
+ENV UV_HTTP_TIMEOUT=180 \
+    UV_CONCURRENT_DOWNLOADS=4
+
 # Copy the main project's dependency files (admin_portal uses same deps)
 COPY pyproject.toml uv.lock README.md ./
 

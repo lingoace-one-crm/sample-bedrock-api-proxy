@@ -16,7 +16,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from app.core.config import settings
 from app.core.exceptions import BedrockAPIError, NoProviderAvailableError
-from app.db.dynamodb import DynamoDBClient, UsageTracker
+from app.db.dynamodb import UsageTracker
 from app.middleware.auth import get_api_key_info
 from app.schemas.anthropic import (
     CountTokensRequest,

@@ -67,3 +67,74 @@ def test_aggregate_usage_input_tokens_exclusive_when_flag_absent():
 
     assert result["total_input_tokens"] == 100
     assert result["total_cached_tokens"] == 30
+
+
+def test_aggregate_usage_tolerates_null_cache_write_tokens():
+    """A record with cache_write_input_tokens stored as DynamoDB NULL (Python
+    None) must not crash the whole aggregation run — it should be treated as
+    zero. Regression test for a bug where a single stale/malformed record
+    (missing this field, e.g. from an older code path) raised
+    ``TypeError: int() argument ... not 'NoneType'`` and aborted
+    ``aggregate_all_usage`` for every API key processed after it, silently
+    freezing budget_used/budget_used_mtd at 0 despite real, billable usage.
+    """
+    manager = UsageStatsManager.__new__(UsageStatsManager)
+    manager.usage_table = MagicMock()
+    manager.usage_table.query.return_value = {
+        "Items": [
+            {
+                "timestamp": "1000",
+                "model": "openai.gpt-5.6-luna",
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cached_tokens": None,
+                "cache_write_input_tokens": None,
+                "metadata": None,
+            }
+        ]
+    }
+
+    # Must not raise TypeError.
+    result = manager.aggregate_usage_for_key("sk-test")
+
+    assert result["total_requests"] == 1
+    assert result["total_input_tokens"] == 100
+    assert result["total_output_tokens"] == 20
+    assert result["total_cached_tokens"] == 0
+    assert result["total_cache_write_tokens"] == 0
+
+
+def test_aggregate_usage_null_record_does_not_abort_later_records():
+    """A malformed record must be tolerated, not just non-fatal for itself —
+    subsequent records in the same query page must still be aggregated.
+    """
+    manager = UsageStatsManager.__new__(UsageStatsManager)
+    manager.usage_table = MagicMock()
+    manager.usage_table.query.return_value = {
+        "Items": [
+            {
+                "timestamp": "1000",
+                "model": "openai.gpt-5.6-luna",
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cached_tokens": None,
+                "cache_write_input_tokens": None,
+                "metadata": None,
+            },
+            {
+                "timestamp": "2000",
+                "model": "openai.gpt-5.6-luna",
+                "input_tokens": 50,
+                "output_tokens": 10,
+                "cached_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "metadata": {},
+            },
+        ]
+    }
+
+    result = manager.aggregate_usage_for_key("sk-test")
+
+    assert result["total_requests"] == 2
+    assert result["total_input_tokens"] == 150
+    assert result["total_output_tokens"] == 30

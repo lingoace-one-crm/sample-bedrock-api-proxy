@@ -479,3 +479,67 @@ def test_proxy_function_tools_retained_without_upstream_server_tools():
     assert len(tools) == 1
     assert tools[0]["name"] == "proxy_search"
     assert tools[0]["type"] == "function"
+
+
+# --- thinking.display → reasoning.summary, and output_config.verbosity → text.verbosity ---
+# summary is opt-in via the display signal Claude Code sends; both are absent by default.
+
+
+def test_thinking_display_summarized_sets_reasoning_summary_auto():
+    request = MessageRequest(
+        model="us.openai.gpt-5.6-luna",
+        max_tokens=256,
+        messages=[Message(role="user", content="hi")],
+        thinking={"type": "enabled", "budget_tokens": 4096, "display": "summarized"},
+    )
+    result = _converter().convert_request(request)
+    assert result["reasoning"]["summary"] == "auto"
+
+
+def test_thinking_display_summarized_merges_with_effort():
+    # thinking (enabled) populates reasoning.effort first; summary must merge in.
+    request = MessageRequest(
+        model="us.openai.gpt-5.6-luna",
+        max_tokens=256,
+        messages=[Message(role="user", content="hi")],
+        output_config={"effort": "high"},
+        thinking={"type": "enabled", "budget_tokens": 4096, "display": "summarized"},
+    )
+    result = _converter().convert_request(request)
+    assert result["reasoning"]["effort"] == "high"
+    assert result["reasoning"]["summary"] == "auto"
+
+
+def test_thinking_display_omitted_sets_no_summary():
+    request = MessageRequest(
+        model="us.openai.gpt-5.6-luna",
+        max_tokens=256,
+        messages=[Message(role="user", content="hi")],
+        thinking={"type": "enabled", "budget_tokens": 4096, "display": "omitted"},
+    )
+    result = _converter().convert_request(request)
+    assert "summary" not in result.get("reasoning", {})
+
+
+def test_output_config_verbosity_forwarded_to_text():
+    request = MessageRequest(
+        model="us.openai.gpt-5.6-luna",
+        max_tokens=256,
+        messages=[Message(role="user", content="hi")],
+        output_config={"verbosity": "high"},
+    )
+    result = _converter().convert_request(request)
+    assert result["text"] == {"verbosity": "high"}
+
+
+def test_no_display_or_output_config_injects_no_summary_or_text():
+    # Regression guard: absent thinking.display and output_config means the
+    # request is unchanged — no reasoning.summary and no text block are added.
+    request = MessageRequest(
+        model="us.openai.gpt-5.6-luna",
+        max_tokens=256,
+        messages=[Message(role="user", content="hi")],
+    )
+    result = _converter().convert_request(request)
+    assert "summary" not in result.get("reasoning", {})
+    assert "text" not in result

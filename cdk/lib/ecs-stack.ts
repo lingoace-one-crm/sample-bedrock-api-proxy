@@ -634,10 +634,10 @@ export class ECSStack extends cdk.Stack {
       cluster: this.cluster,
       taskDefinition,
       desiredCount: config.ecsDesiredCount,
-      assignPublicIp: false,
+      assignPublicIp: process.env.USE_PUBLIC_SUBNETS === 'true' ? true : false,
       securityGroups: [ecsSecurityGroup],
       vpcSubnets: {
-        subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        subnetType: process.env.USE_PUBLIC_SUBNETS === 'true' ? ec2.SubnetType.PUBLIC : ec2.SubnetType.PRIVATE_WITH_EGRESS,
       },
       healthCheckGracePeriod: cdk.Duration.seconds(300),
       circuitBreaker: {
@@ -1077,10 +1077,10 @@ export class ECSStack extends cdk.Stack {
       cluster: this.cluster,
       taskDefinition: adminTaskDefinition,
       desiredCount: config.adminPortalMinCapacity,
-      assignPublicIp: false,
+      assignPublicIp: process.env.USE_PUBLIC_SUBNETS === 'true' ? true : false,
       securityGroups: [ecsSecurityGroup],
       vpcSubnets: {
-        subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        subnetType: process.env.USE_PUBLIC_SUBNETS === 'true' ? ec2.SubnetType.PUBLIC : ec2.SubnetType.PRIVATE_WITH_EGRESS,
       },
       healthCheckGracePeriod: cdk.Duration.seconds(120),
       circuitBreaker: {

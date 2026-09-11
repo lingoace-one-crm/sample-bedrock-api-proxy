@@ -11,7 +11,7 @@ import {
   useProviders,
 } from '../hooks';
 import type { ApiKey, ApiKeyCreate, ApiKeyUpdate } from '../types';
-import { formatTokens, cacheHitRate, formatCacheHitRate } from '../utils';
+import { formatTokens, anthropicCacheHitRate, otherCacheHitRate, formatCacheHitRate } from '../utils';
 import UsageHoverChart from '../components/UsageHoverChart';
 
 // Modal Component
@@ -302,13 +302,18 @@ export default function ApiKeys() {
       return;
     }
 
-    const headers = ['API Key', 'Name', 'Owner', 'User ID', 'Status', 'Monthly Budget', 'Budget Used (MTD)', 'Budget Used (Total)', 'Rate Limit', 'Service Tier', 'Cache TTL', 'Created At', 'Total Requests', 'Total Input Tokens', 'Total Output Tokens', 'Total Cached Tokens', 'Total Cache Write Tokens', 'Cache Hit Rate (%)'];
+    const headers = ['API Key', 'Name', 'Owner', 'User ID', 'Status', 'Monthly Budget', 'Budget Used (MTD)', 'Budget Used (Total)', 'Rate Limit', 'Service Tier', 'Cache TTL', 'Created At', 'Total Requests', 'Total Input Tokens', 'Total Output Tokens', 'Total Cached Tokens', 'Total Cache Write Tokens', 'Anthropic Cache Hit Rate (%)', 'Other Cache Hit Rate (%)'];
 
     const rows = apiKeys.map((key) => {
-      const hitRate = cacheHitRate(
-        key.total_cached_tokens,
-        key.total_cache_write_tokens,
-        key.total_input_tokens
+      const anthropicHitRate = anthropicCacheHitRate(
+        key.anthropic_cached_tokens,
+        key.anthropic_cache_write_tokens,
+        key.anthropic_input_tokens
+      );
+      const otherHitRate = otherCacheHitRate(
+        (key.total_cached_tokens || 0) - (key.anthropic_cached_tokens || 0),
+        (key.total_cache_write_tokens || 0) - (key.anthropic_cache_write_tokens || 0),
+        (key.total_input_tokens || 0) - (key.anthropic_input_tokens || 0)
       );
       return [
         key.api_key,
@@ -328,7 +333,8 @@ export default function ApiKeys() {
         key.total_output_tokens || 0,
         key.total_cached_tokens || 0,
         key.total_cache_write_tokens || 0,
-        hitRate === null ? '' : hitRate.toFixed(1),
+        anthropicHitRate === null ? '' : anthropicHitRate.toFixed(1),
+        otherHitRate === null ? '' : otherHitRate.toFixed(1),
       ];
     });
 
@@ -646,11 +652,18 @@ export default function ApiKeys() {
                     ? Math.round((mtdBudget / key.monthly_budget) * 100)
                     : 0;
 
-                  // Prompt cache hit rate: cacheRead / (cacheRead + cacheWrite + input)
-                  const hitRate = cacheHitRate(
-                    key.total_cached_tokens,
-                    key.total_cache_write_tokens,
-                    key.total_input_tokens
+                  // Anthropic (Claude) prompt cache hit rate: cacheRead / (cacheRead + cacheWrite + input)
+                  const anthropicHitRate = anthropicCacheHitRate(
+                    key.anthropic_cached_tokens,
+                    key.anthropic_cache_write_tokens,
+                    key.anthropic_input_tokens
+                  );
+
+                  // Non-Anthropic (e.g. OpenAI-compatible) prompt cache hit rate: cacheRead / (cacheRead + input)
+                  const otherHitRate = otherCacheHitRate(
+                    (key.total_cached_tokens || 0) - (key.anthropic_cached_tokens || 0),
+                    (key.total_cache_write_tokens || 0) - (key.anthropic_cache_write_tokens || 0),
+                    (key.total_input_tokens || 0) - (key.anthropic_input_tokens || 0)
                   );
 
                   return (
@@ -738,24 +751,43 @@ export default function ApiKeys() {
                               </span>
                               <span className="text-xs text-slate-500">{t('apiKeys.cacheWrite')}</span>
                             </div>
-                            <div className="flex items-center gap-2" title={t('apiKeys.cacheHitRateTooltip')}>
+                            <div className="flex items-center gap-2" title={t('apiKeys.anthropicCacheHitRateTooltip')}>
                               <span className="material-symbols-outlined text-[14px] text-cyan-400">
                                 speed
                               </span>
                               <span
                                 className={`text-xs font-semibold ${
-                                  hitRate === null
+                                  anthropicHitRate === null
                                     ? 'text-slate-400'
-                                    : hitRate >= 70
+                                    : anthropicHitRate >= 70
                                     ? 'text-emerald-400'
-                                    : hitRate >= 40
+                                    : anthropicHitRate >= 40
                                     ? 'text-amber-400'
                                     : 'text-red-400'
                                 }`}
                               >
-                                {formatCacheHitRate(hitRate)}
+                                {formatCacheHitRate(anthropicHitRate)}
                               </span>
-                              <span className="text-xs text-slate-500">{t('apiKeys.cacheHitRate')}</span>
+                              <span className="text-xs text-slate-500">{t('apiKeys.anthropicCacheHitRate')}</span>
+                            </div>
+                            <div className="flex items-center gap-2" title={t('apiKeys.otherCacheHitRateTooltip')}>
+                              <span className="material-symbols-outlined text-[14px] text-cyan-400">
+                                speed
+                              </span>
+                              <span
+                                className={`text-xs font-semibold ${
+                                  otherHitRate === null
+                                    ? 'text-slate-400'
+                                    : otherHitRate >= 70
+                                    ? 'text-emerald-400'
+                                    : otherHitRate >= 40
+                                    ? 'text-amber-400'
+                                    : 'text-red-400'
+                                }`}
+                              >
+                                {formatCacheHitRate(otherHitRate)}
+                              </span>
+                              <span className="text-xs text-slate-500">{t('apiKeys.otherCacheHitRate')}</span>
                             </div>
                             <span className="text-[10px] text-slate-500">
                               {(key.total_requests || 0).toLocaleString()} {t('apiKeys.requests')}

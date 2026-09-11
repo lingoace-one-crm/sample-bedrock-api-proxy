@@ -75,12 +75,18 @@ async def list_api_keys(
             item["total_cached_tokens"] = int(stats.get("total_cached_tokens", 0))
             item["total_cache_write_tokens"] = int(stats.get("total_cache_write_tokens", 0))
             item["total_requests"] = int(stats.get("total_requests", 0))
+            item["anthropic_input_tokens"] = int(stats.get("anthropic_input_tokens", 0))
+            item["anthropic_cached_tokens"] = int(stats.get("anthropic_cached_tokens", 0))
+            item["anthropic_cache_write_tokens"] = int(stats.get("anthropic_cache_write_tokens", 0))
         else:
             item["total_input_tokens"] = 0
             item["total_output_tokens"] = 0
             item["total_cached_tokens"] = 0
             item["total_cache_write_tokens"] = 0
             item["total_requests"] = 0
+            item["anthropic_input_tokens"] = 0
+            item["anthropic_cached_tokens"] = 0
+            item["anthropic_cache_write_tokens"] = 0
 
     return ApiKeyListResponse(
         items=[ApiKeyResponse(**item) for item in items],
@@ -326,6 +332,9 @@ async def get_api_key_usage(api_key: str):
             "total_cached_tokens": 0,
             "total_cache_write_tokens": 0,
             "total_requests": 0,
+            "anthropic_input_tokens": 0,
+            "anthropic_cached_tokens": 0,
+            "anthropic_cache_write_tokens": 0,
         },
         "recent": recent_stats,
     }

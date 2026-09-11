@@ -1095,6 +1095,37 @@ def _record_cost(
     )
 
 
+def _is_anthropic_model(model: str, pricing: Optional[Dict[str, Any]]) -> bool:
+    """Determine whether a usage record's model should be attributed to Anthropic.
+
+    Used to split prompt-cache stats into an Anthropic bucket (which has a
+    genuine cache_creation_input_tokens/"write" concept) vs. everything else
+    (OpenAI-compatible models such as GPT-5.x via Bedrock Mantle only report
+    cache reads, with no equivalent "write" signal) — see
+    ``aggregate_usage_for_key``.
+
+    Prefers the authoritative ``provider`` field from the Model Pricing table
+    (e.g. "Anthropic" vs "OpenAI") when a pricing row was found for this
+    model. Falls back to a model-id prefix heuristic when there's no pricing
+    row (new/unpriced models shouldn't silently fall out of both buckets).
+
+    Args:
+        model: The raw model id as recorded on the usage record (may be an
+            Anthropic-style alias, an inference profile id, or a
+            provider-prefixed OpenAI-compatible id like "openai.gpt-5.6-luna").
+        pricing: The Model Pricing table row for this model's resolved
+            Bedrock id, if one was found in the pricing cache.
+
+    Returns:
+        True if the model should be counted in the Anthropic cache-stats bucket.
+    """
+    if pricing and pricing.get("provider"):
+        return str(pricing["provider"]).strip().lower() == "anthropic"
+
+    model_lower = (model or "").lower()
+    return "anthropic" in model_lower or "claude" in model_lower
+
+
 class UsageTracker:
     """Tracker for API usage and analytics."""
 
@@ -1729,6 +1760,9 @@ class UsageStatsManager:
         cache_write_tokens: int,
         request_count: int,
         last_aggregated_timestamp: Optional[int] = None,
+        anthropic_input_tokens: int = 0,
+        anthropic_cached_tokens: int = 0,
+        anthropic_cache_write_tokens: int = 0,
     ) -> bool:
         """
         Update or create aggregated usage stats for an API key.
@@ -1741,6 +1775,9 @@ class UsageStatsManager:
             cache_write_tokens: Total cache write tokens
             request_count: Total request count
             last_aggregated_timestamp: Timestamp of the last processed record (for incremental aggregation)
+            anthropic_input_tokens: Subset of input_tokens attributable to Anthropic models
+            anthropic_cached_tokens: Subset of cached_tokens attributable to Anthropic models
+            anthropic_cache_write_tokens: Subset of cache_write_tokens attributable to Anthropic models
 
         Returns:
             True if updated successfully
@@ -1753,6 +1790,9 @@ class UsageStatsManager:
                 "total_cached_tokens": cached_tokens,
                 "total_cache_write_tokens": cache_write_tokens,
                 "total_requests": request_count,
+                "anthropic_input_tokens": anthropic_input_tokens,
+                "anthropic_cached_tokens": anthropic_cached_tokens,
+                "anthropic_cache_write_tokens": anthropic_cache_write_tokens,
                 "last_updated": int(time.time()),
             }
             if last_aggregated_timestamp is not None:
@@ -1771,6 +1811,9 @@ class UsageStatsManager:
         delta_cache_write_tokens: int,
         delta_request_count: int,
         last_aggregated_timestamp: int,
+        delta_anthropic_input_tokens: int = 0,
+        delta_anthropic_cached_tokens: int = 0,
+        delta_anthropic_cache_write_tokens: int = 0,
     ) -> bool:
         """
         Incrementally update usage stats for an API key.
@@ -1783,6 +1826,9 @@ class UsageStatsManager:
             delta_cache_write_tokens: Cache write tokens to add
             delta_request_count: Request count to add
             last_aggregated_timestamp: New timestamp of the last processed record
+            delta_anthropic_input_tokens: Anthropic-attributed input tokens to add
+            delta_anthropic_cached_tokens: Anthropic-attributed cached tokens to add
+            delta_anthropic_cache_write_tokens: Anthropic-attributed cache write tokens to add
 
         Returns:
             True if updated successfully
@@ -1796,6 +1842,9 @@ class UsageStatsManager:
                         total_cached_tokens = if_not_exists(total_cached_tokens, :zero) + :cached_tokens,
                         total_cache_write_tokens = if_not_exists(total_cache_write_tokens, :zero) + :cache_write_tokens,
                         total_requests = if_not_exists(total_requests, :zero) + :request_count,
+                        anthropic_input_tokens = if_not_exists(anthropic_input_tokens, :zero) + :anthropic_input_tokens,
+                        anthropic_cached_tokens = if_not_exists(anthropic_cached_tokens, :zero) + :anthropic_cached_tokens,
+                        anthropic_cache_write_tokens = if_not_exists(anthropic_cache_write_tokens, :zero) + :anthropic_cache_write_tokens,
                         last_aggregated_timestamp = :last_timestamp,
                         last_updated = :now
                 """,
@@ -1805,6 +1854,9 @@ class UsageStatsManager:
                     ":cached_tokens": delta_cached_tokens,
                     ":cache_write_tokens": delta_cache_write_tokens,
                     ":request_count": delta_request_count,
+                    ":anthropic_input_tokens": delta_anthropic_input_tokens,
+                    ":anthropic_cached_tokens": delta_anthropic_cached_tokens,
+                    ":anthropic_cache_write_tokens": delta_anthropic_cache_write_tokens,
                     ":last_timestamp": last_aggregated_timestamp,
                     ":now": int(time.time()),
                     ":zero": 0,
@@ -1847,7 +1899,16 @@ class UsageStatsManager:
             since_timestamp: Optional timestamp to filter records (only process records > this timestamp)
 
         Returns:
-            Dictionary with aggregated stats including total_cost and max_timestamp
+            Dictionary with aggregated stats including total_cost and max_timestamp,
+            plus an ``anthropic_*`` breakdown of the cache-related and input token
+            totals (see module-level ``_is_anthropic_model`` for how a record is
+            attributed to Anthropic vs. everything else). This split exists
+            because Anthropic's cache accounting has a distinct
+            cache_creation_input_tokens ("write") concept that OpenAI-compatible
+            models (GPT-5.x via Bedrock Mantle, etc.) don't report at all — a
+            single combined cache-hit-rate formula either over- or
+            under-counts one side, so the two are kept separate all the way
+            through to display.
         """
         total_input_tokens = 0
         total_output_tokens = 0
@@ -1856,6 +1917,13 @@ class UsageStatsManager:
         total_requests = 0
         total_cost = 0.0
         max_timestamp = since_timestamp or 0
+
+        # Anthropic-attributed subset of the cache/input totals above (see
+        # docstring). Not accumulated for output tokens or request count
+        # since only the cache hit rate calculation needs the split.
+        anthropic_input_tokens = 0
+        anthropic_cached_tokens = 0
+        anthropic_cache_write_tokens = 0
 
         try:
             # Build query parameters
@@ -1885,16 +1953,17 @@ class UsageStatsManager:
                 response = self.usage_table.query(**paginator_params)
 
                 for item in response.get("Items", []):
-                    input_tokens = int(item.get("input_tokens", 0))
-                    output_tokens = int(item.get("output_tokens", 0))
-                    cached_tokens = int(item.get("cached_tokens", 0))
-                    cache_write_tokens = int(item.get("cache_write_input_tokens", 0))
-                    record_timestamp = int(item.get("timestamp", 0))
+                    input_tokens = int(item.get("input_tokens", 0) or 0)
+                    output_tokens = int(item.get("output_tokens", 0) or 0)
+                    cached_tokens = int(item.get("cached_tokens", 0) or 0)
+                    cache_write_tokens = int(item.get("cache_write_input_tokens", 0) or 0)
+                    record_timestamp = int(item.get("timestamp", 0) or 0)
                     metadata = item.get("metadata") or {}
 
-                    total_input_tokens += _displayed_input_tokens(
+                    displayed_input = _displayed_input_tokens(
                         input_tokens, cached_tokens, cache_write_tokens, metadata
                     )
+                    total_input_tokens += displayed_input
                     total_output_tokens += output_tokens
                     total_cached_tokens += cached_tokens
                     total_cache_write_tokens += cache_write_tokens
@@ -1904,12 +1973,22 @@ class UsageStatsManager:
                     if record_timestamp > max_timestamp:
                         max_timestamp = record_timestamp
 
-                    # Calculate cost for this request if pricing is available
+                    # Calculate cost for this request if pricing is available.
+                    # bedrock_model_id 必须在 if 之外初始化：一条缺 model 字段的记录会跳过
+                    # 下面的 if，若把它留在 if 内定义，后续的 provider 归属判断会触发
+                    # UnboundLocalError 并中断整个聚合循环（连带后面所有记录）。
                     model = item.get("model", "")
+                    pricing_row = None
                     if pricing_cache and model:
                         # Resolve model ID to Bedrock format for pricing lookup
                         bedrock_model_id = self._resolve_model_id(model, model_mapping_cache)
-                        total_cost += _record_cost(item, pricing_cache.get(bedrock_model_id))
+                        pricing_row = pricing_cache.get(bedrock_model_id)
+                        total_cost += _record_cost(item, pricing_row)
+
+                    if _is_anthropic_model(model, pricing_row):
+                        anthropic_input_tokens += displayed_input
+                        anthropic_cached_tokens += cached_tokens
+                        anthropic_cache_write_tokens += cache_write_tokens
 
                 last_key = response.get("LastEvaluatedKey")
                 if not last_key:
@@ -1924,6 +2003,9 @@ class UsageStatsManager:
             "total_cached_tokens": total_cached_tokens,
             "total_cache_write_tokens": total_cache_write_tokens,
             "total_requests": total_requests,
+            "anthropic_input_tokens": anthropic_input_tokens,
+            "anthropic_cached_tokens": anthropic_cached_tokens,
+            "anthropic_cache_write_tokens": anthropic_cache_write_tokens,
             "total_cost": total_cost,
             "max_timestamp": max_timestamp,
         }
@@ -2149,6 +2231,9 @@ class UsageStatsManager:
                     delta_cache_write_tokens=int(stats["total_cache_write_tokens"]),
                     delta_request_count=int(stats["total_requests"]),
                     last_aggregated_timestamp=max_timestamp,
+                    delta_anthropic_input_tokens=int(stats["anthropic_input_tokens"]),
+                    delta_anthropic_cached_tokens=int(stats["anthropic_cached_tokens"]),
+                    delta_anthropic_cache_write_tokens=int(stats["anthropic_cache_write_tokens"]),
                 ):
                     count += 1
 
@@ -2168,6 +2253,9 @@ class UsageStatsManager:
                     cache_write_tokens=int(stats["total_cache_write_tokens"]),
                     request_count=int(stats["total_requests"]),
                     last_aggregated_timestamp=max_timestamp,
+                    anthropic_input_tokens=int(stats["anthropic_input_tokens"]),
+                    anthropic_cached_tokens=int(stats["anthropic_cached_tokens"]),
+                    anthropic_cache_write_tokens=int(stats["anthropic_cache_write_tokens"]),
                 ):
                     count += 1
 

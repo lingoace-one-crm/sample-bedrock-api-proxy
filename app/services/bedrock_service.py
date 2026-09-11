@@ -1776,10 +1776,10 @@ class BedrockService:
         merged: Dict[str, str] = dict(settings.default_model_mapping)
 
         try:
-            from app.db.dynamodb import DynamoDBClient
+            from app.db.dynamodb import DynamoDBClient, ModelMappingManager
 
             db = DynamoDBClient()
-            for row in db.model_mapping_manager.list_mappings():
+            for row in ModelMappingManager(db).list_mappings():
                 a_id = row.get("anthropic_model_id")
                 b_id = row.get("bedrock_model_id")
                 if a_id and b_id:
@@ -1797,27 +1797,74 @@ class BedrockService:
             for a_id, b_id in merged.items()
         ]
 
+    def _resolve_model_alias(self, model_id: str) -> str:
+        """
+        Resolve a proxy-facing model alias (e.g. "claude-sonnet-5", "gpt-5.5",
+        "openai.gpt-5.6-luna") to the real Bedrock model id Bedrock's control
+        plane and runtime APIs expect (e.g. "global.anthropic.claude-sonnet-5").
+
+        Sourced from `settings.default_model_mapping` merged with the
+        `ModelMappingTable` in DynamoDB (DDB entries win on conflict). If no
+        mapping is found (the caller already passed a real Bedrock model id,
+        or DDB is unreachable), the input is returned unchanged — Bedrock will
+        reject it directly if it's genuinely invalid.
+        """
+        merged: Dict[str, str] = dict(settings.default_model_mapping)
+
+        try:
+            from app.db.dynamodb import DynamoDBClient, ModelMappingManager
+
+            db = DynamoDBClient()
+            for row in ModelMappingManager(db).list_mappings():
+                a_id = row.get("anthropic_model_id")
+                b_id = row.get("bedrock_model_id")
+                if a_id and b_id:
+                    merged[a_id] = b_id
+        except Exception as e:
+            logger.warning("Failed to load DDB model mappings: %s", e)
+
+        return merged.get(model_id, model_id)
+
     def get_model_info(self, model_id: str) -> Optional[Dict[str, Any]]:
         """
         Get information about a specific model.
 
         Args:
-            model_id: Bedrock model ID
+            model_id: Model identifier — accepts either a proxy-facing alias
+                (e.g. "claude-sonnet-5", "gpt-5.5", "openai.gpt-5.6-luna") or a
+                real Bedrock model/inference-profile id. Aliases are resolved
+                via `_resolve_model_alias` before calling Bedrock's control
+                plane.
+
+        Note:
+            Bedrock has two distinct control-plane resources that both show
+            up as "model ids" to callers of this proxy:
+              - Foundation models (e.g. "anthropic.claude-sonnet-5"),
+                queried via `get_foundation_model`.
+              - Inference profiles (e.g. "global.anthropic.claude-sonnet-5",
+                "us.anthropic.claude-*"), queried via `get_inference_profile`.
+            `settings.default_model_mapping` targets are almost all inference
+            profile ids, which `get_foundation_model` cannot look up (it
+            raises ResourceNotFoundException even though the profile is
+            valid and active). This method tries `get_foundation_model`
+            first, and falls back to `get_inference_profile` on
+            ResourceNotFoundException before giving up.
 
         Returns:
             Model information or None if not found
         """
-        try:
-            bedrock_client = boto3.client(
-                "bedrock",
-                region_name=settings.aws_region,
-                endpoint_url=settings.bedrock_endpoint_url,
-                aws_access_key_id=settings.aws_access_key_id,
-                aws_secret_access_key=settings.aws_secret_access_key,
-                aws_session_token=settings.aws_session_token,
-            )
+        resolved_model_id = self._resolve_model_alias(model_id)
+        bedrock_client = boto3.client(
+            "bedrock",
+            region_name=settings.aws_region,
+            endpoint_url=settings.bedrock_endpoint_url,
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+            aws_session_token=settings.aws_session_token,
+        )
 
-            response = bedrock_client.get_foundation_model(modelIdentifier=model_id)
+        try:
+            response = bedrock_client.get_foundation_model(modelIdentifier=resolved_model_id)
             model_details = response.get("modelDetails", {})
 
             return {
@@ -1835,7 +1882,32 @@ class BedrockService:
             }
 
         except ClientError as e:
-            if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            error_code = e.response["Error"]["Code"]
+            if error_code == "ResourceNotFoundException":
+                # Not a foundation model id — it may be an inference profile.
+                try:
+                    profile_response = bedrock_client.get_inference_profile(
+                        inferenceProfileIdentifier=resolved_model_id
+                    )
+                except ClientError as profile_e:
+                    profile_error_code = profile_e.response["Error"]["Code"]
+                    if profile_error_code in ("ResourceNotFoundException", "ValidationException"):
+                        return None
+                    raise Exception(f"Failed to get model info: {str(profile_e)}")
+
+                return {
+                    "id": profile_response.get("inferenceProfileId"),
+                    "name": profile_response.get("inferenceProfileName"),
+                    "provider": _derive_provider(resolved_model_id),
+                    "input_modalities": [],
+                    "output_modalities": [],
+                    "streaming_supported": True,
+                    "customizations_supported": [],
+                }
+            if error_code == "ValidationException":
+                # Identifier Bedrock's control plane doesn't recognize at
+                # all (e.g. an alias with no mapping entry, or a malformed
+                # id) — treat as "not found" rather than surfacing a 500.
                 return None
             raise Exception(f"Failed to get model info: {str(e)}")
         except Exception as e:

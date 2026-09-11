@@ -18,23 +18,32 @@ export class NetworkStack extends cdk.Stack {
     const { config } = props;
 
     // Create VPC with public and private subnets across multiple AZs
+    const usePublicSubnets = process.env.USE_PUBLIC_SUBNETS === 'true';
     this.vpc = new ec2.Vpc(this, 'VPC', {
       vpcName: `anthropic-proxy-${config.environmentName}-vpc`,
       ipAddresses: ec2.IpAddresses.cidr(config.vpcCidr),
       maxAzs: config.maxAzs,
-      natGateways: config.environmentName === 'prod' ? config.maxAzs : 1,
-      subnetConfiguration: [
-        {
-          name: 'Public',
-          subnetType: ec2.SubnetType.PUBLIC,
-          cidrMask: 24,
-        },
-        {
-          name: 'Private',
-          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
-          cidrMask: 24,
-        },
-      ],
+      natGateways: usePublicSubnets ? 0 : (config.environmentName === 'prod' ? config.maxAzs : 1),
+      subnetConfiguration: usePublicSubnets
+        ? [
+            {
+              name: 'Public',
+              subnetType: ec2.SubnetType.PUBLIC,
+              cidrMask: 24,
+            },
+          ]
+        : [
+            {
+              name: 'Public',
+              subnetType: ec2.SubnetType.PUBLIC,
+              cidrMask: 24,
+            },
+            {
+              name: 'Private',
+              subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+              cidrMask: 24,
+            },
+          ],
       enableDnsHostnames: true,
       enableDnsSupport: true,
     });

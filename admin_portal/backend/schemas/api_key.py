@@ -68,6 +68,16 @@ class ApiKeyResponse(BaseModel):
     total_cached_tokens: Optional[int] = 0       # Cache read tokens
     total_cache_write_tokens: Optional[int] = 0  # Cache write tokens
     total_requests: Optional[int] = 0
+    # Anthropic-attributed subset of the cache/input totals above. Kept
+    # separate because Anthropic models report a genuine
+    # cache_creation_input_tokens ("write") signal that OpenAI-compatible
+    # models (GPT-5.x via Bedrock Mantle, etc.) don't have an equivalent
+    # for — a single combined cache-hit-rate formula misrepresents one side
+    # or the other, so the frontend computes two independent rates from
+    # this split. See UsageStatsManager.aggregate_usage_for_key.
+    anthropic_input_tokens: Optional[int] = 0
+    anthropic_cached_tokens: Optional[int] = 0
+    anthropic_cache_write_tokens: Optional[int] = 0
 
     @field_validator('created_at', 'updated_at', mode='before')
     @classmethod

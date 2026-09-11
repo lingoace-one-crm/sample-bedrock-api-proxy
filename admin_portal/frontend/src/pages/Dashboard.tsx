@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { Link } from 'react-router-dom';
 import { useDashboardStats } from '../hooks';
-import { formatTokens, cacheHitRate, formatCacheHitRate } from '../utils';
+import { formatTokens, anthropicCacheHitRate, otherCacheHitRate, formatCacheHitRate } from '../utils';
 import DailyUsageChart from '../components/DailyUsageChart';
 
 export default function Dashboard() {
@@ -33,11 +33,18 @@ export default function Dashboard() {
     ? Math.round((stats.total_budget_used / Math.max(stats.total_budget, 1)) * 100)
     : 0;
 
-  // Overall prompt cache hit rate: cacheRead / (cacheRead + cacheWrite + input)
-  const overallHitRate = cacheHitRate(
-    stats?.total_cached_tokens,
-    stats?.total_cache_write_tokens,
-    stats?.total_input_tokens
+  // Anthropic (Claude) prompt cache hit rate: cacheRead / (cacheRead + cacheWrite + input)
+  const anthropicHitRate = anthropicCacheHitRate(
+    stats?.anthropic_cached_tokens,
+    stats?.anthropic_cache_write_tokens,
+    stats?.anthropic_input_tokens
+  );
+
+  // Non-Anthropic (e.g. OpenAI-compatible) prompt cache hit rate: cacheRead / (cacheRead + input)
+  const otherHitRate = otherCacheHitRate(
+    (stats?.total_cached_tokens || 0) - (stats?.anthropic_cached_tokens || 0),
+    (stats?.total_cache_write_tokens || 0) - (stats?.anthropic_cache_write_tokens || 0),
+    (stats?.total_input_tokens || 0) - (stats?.anthropic_input_tokens || 0)
   );
 
   return (
@@ -139,7 +146,7 @@ export default function Dashboard() {
           <span className="text-slate-400 text-sm font-medium">{t('dashboard.totalTokenUsage')}</span>
           <span className="material-symbols-outlined text-cyan-500">token</span>
         </div>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4">
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-2">
               <span className="material-symbols-outlined text-[16px] text-emerald-500">arrow_upward</span>
@@ -175,23 +182,42 @@ export default function Dashboard() {
             </div>
             <span className="text-lg font-bold text-white">{(stats?.total_requests || 0).toLocaleString()}</span>
           </div>
-          <div className="flex flex-col gap-1" title={t('apiKeys.cacheHitRateTooltip')}>
+          <div className="flex flex-col gap-1" title={t('apiKeys.anthropicCacheHitRateTooltip')}>
             <div className="flex items-center gap-2">
               <span className="material-symbols-outlined text-[16px] text-cyan-400">speed</span>
-              <span className="text-xs text-slate-400">{t('apiKeys.cacheHitRate')}</span>
+              <span className="text-xs text-slate-400">{t('apiKeys.anthropicCacheHitRate')}</span>
             </div>
             <span
               className={`text-lg font-bold ${
-                overallHitRate === null
+                anthropicHitRate === null
                   ? 'text-white'
-                  : overallHitRate >= 70
+                  : anthropicHitRate >= 70
                   ? 'text-emerald-400'
-                  : overallHitRate >= 40
+                  : anthropicHitRate >= 40
                   ? 'text-amber-400'
                   : 'text-red-400'
               }`}
             >
-              {formatCacheHitRate(overallHitRate)}
+              {formatCacheHitRate(anthropicHitRate)}
+            </span>
+          </div>
+          <div className="flex flex-col gap-1" title={t('apiKeys.otherCacheHitRateTooltip')}>
+            <div className="flex items-center gap-2">
+              <span className="material-symbols-outlined text-[16px] text-cyan-400">speed</span>
+              <span className="text-xs text-slate-400">{t('apiKeys.otherCacheHitRate')}</span>
+            </div>
+            <span
+              className={`text-lg font-bold ${
+                otherHitRate === null
+                  ? 'text-white'
+                  : otherHitRate >= 70
+                  ? 'text-emerald-400'
+                  : otherHitRate >= 40
+                  ? 'text-amber-400'
+                  : 'text-red-400'
+              }`}
+            >
+              {formatCacheHitRate(otherHitRate)}
             </span>
           </div>
         </div>

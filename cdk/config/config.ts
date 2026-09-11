@@ -188,8 +188,10 @@ export const environments: { [key: string]: EnvironmentConfigWithoutRuntime } = 
     // defaultCacheTtl: '1h',
 
     // Bedrock Concurrency
-    bedrockThreadPoolSize: 15,
-    bedrockSemaphoreSize: 15,
+    // 15 排空过窄：热门 Responses 模型（如 gpt-5.x）响应时间重尾，突发窗口的并发需求会超过信号量上限，多出的请求在进程内排队
+    // ——ALB 5xx/CPU 告警看不到（CPU 远未到自动扩容阈值），表现为响应变慢。40 覆盖实测突发并发。
+    bedrockThreadPoolSize: 40,
+    bedrockSemaphoreSize: 40,
 
     // OpenTelemetry Tracing
     enableTracing: false,
@@ -305,8 +307,9 @@ export const environments: { [key: string]: EnvironmentConfigWithoutRuntime } = 
     // defaultCacheTtl: '1h',
 
     // Bedrock Concurrency
-    bedrockThreadPoolSize: 30,
-    bedrockSemaphoreSize: 30,
+    // 见 dev 段说明：prod 与 dev 保持一致的 40。
+    bedrockThreadPoolSize: 40,
+    bedrockSemaphoreSize: 40,
 
     // OpenTelemetry Tracing
     enableTracing: false,

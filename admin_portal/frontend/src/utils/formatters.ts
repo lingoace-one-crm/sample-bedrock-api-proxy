@@ -59,31 +59,87 @@ export function formatCurrency(value: number | undefined | null, decimals: numbe
 }
 
 /**
- * Compute the prompt cache hit rate as a percentage (0-100).
+ * Compute a prompt cache hit rate as a percentage (0-100).
  *
- * Formula: cacheRead / (cacheRead + cacheWrite + input)
+ * Two distinct formulas exist because Anthropic's cache accounting has a
+ * genuine cache_creation_input_tokens ("write") concept, while
+ * OpenAI-compatible models (GPT-5.x via Bedrock Mantle, etc.) only report
+ * cache reads — there's no equivalent "write" signal for those models, so
+ * their write count is always 0.
  *
- * Here `input` is the cache-exclusive (uncached) input token count, so the
- * denominator is the total number of prompt-side tokens processed. Returns
- * `null` when there were no prompt-side tokens at all (avoids divide-by-zero),
- * which callers can render as a placeholder (e.g. "—").
+ * - Anthropic formula: cacheRead / (cacheRead + cacheWrite + input)
+ * - Non-Anthropic formula: cacheRead / (cacheRead + input)
+ *
+ * Excluding cacheWrite for non-Anthropic models isn't optional cosmetics:
+ * without it, every request's first-turn, not-yet-cached tokens land in
+ * `input` (since there's no `write` bucket to split them into), inflating
+ * the denominator and making the reported rate come out well below the
+ * model's actual cache effectiveness. Anthropic keeps `write` in its
+ * formula because it genuinely tracks the read/write split, so the
+ * denominator there is intentionally the full set of prompt-side tokens.
+ *
+ * Use `anthropicCacheHitRate` / `otherCacheHitRate` (below) at call sites
+ * instead of calling this directly — they make the model attribution
+ * explicit and harder to get backwards.
+ *
+ * Returns `null` when there were no prompt-side tokens at all (avoids
+ * divide-by-zero), which callers can render as a placeholder (e.g. "—").
  *
  * @param cacheRead - Cache read (cached) input tokens
  * @param cacheWrite - Cache write (cache creation) tokens
  * @param input - Uncached input tokens
+ * @param includeWrite - Whether to include cacheWrite in the denominator
+ *   (true for Anthropic, false for everything else)
  * @returns Hit rate percentage (0-100), or null when no prompt tokens exist
  */
-export function cacheHitRate(
+function computeCacheHitRate(
   cacheRead: number | undefined | null,
   cacheWrite: number | undefined | null,
-  input: number | undefined | null
+  input: number | undefined | null,
+  includeWrite: boolean
 ): number | null {
   const read = cacheRead || 0;
-  const write = cacheWrite || 0;
+  const write = includeWrite ? cacheWrite || 0 : 0;
   const inp = input || 0;
   const denominator = read + write + inp;
   if (denominator <= 0) return null;
   return (read / denominator) * 100;
+}
+
+/**
+ * Prompt cache hit rate for Anthropic (Claude) models.
+ *
+ * Formula: cacheRead / (cacheRead + cacheWrite + input)
+ *
+ * @param cacheRead - Anthropic-attributed cache read tokens
+ * @param cacheWrite - Anthropic-attributed cache write tokens
+ * @param input - Anthropic-attributed uncached input tokens
+ */
+export function anthropicCacheHitRate(
+  cacheRead: number | undefined | null,
+  cacheWrite: number | undefined | null,
+  input: number | undefined | null
+): number | null {
+  return computeCacheHitRate(cacheRead, cacheWrite, input, true);
+}
+
+/**
+ * Prompt cache hit rate for non-Anthropic (e.g. OpenAI-compatible) models.
+ *
+ * Formula: cacheRead / (cacheRead + input) — cacheWrite is not part of this
+ * formula (these providers don't report a write count), but is accepted
+ * for call-site symmetry with `anthropicCacheHitRate` and simply ignored.
+ *
+ * @param cacheRead - Non-Anthropic-attributed cache read tokens
+ * @param cacheWrite - Unused; accepted for signature symmetry
+ * @param input - Non-Anthropic-attributed uncached input tokens
+ */
+export function otherCacheHitRate(
+  cacheRead: number | undefined | null,
+  cacheWrite: number | undefined | null,
+  input: number | undefined | null
+): number | null {
+  return computeCacheHitRate(cacheRead, cacheWrite, input, false);
 }
 
 /**

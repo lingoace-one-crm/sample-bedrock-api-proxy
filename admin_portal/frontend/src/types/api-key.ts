@@ -26,6 +26,13 @@ export interface ApiKey {
   total_cached_tokens?: number;      // Cache read tokens
   total_cache_write_tokens?: number; // Cache write tokens
   total_requests?: number;
+  // Anthropic-attributed subset of the cache/input totals above. Kept
+  // separate because Anthropic models report a genuine cache-write signal
+  // that non-Anthropic (e.g. OpenAI-compatible) models don't have an
+  // equivalent for — see anthropicCacheHitRate/otherCacheHitRate in utils.
+  anthropic_input_tokens?: number;
+  anthropic_cached_tokens?: number;
+  anthropic_cache_write_tokens?: number;
 }
 
 export interface ApiKeyCreate {

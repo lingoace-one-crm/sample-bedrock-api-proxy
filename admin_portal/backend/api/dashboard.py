@@ -223,6 +223,9 @@ async def get_dashboard_stats():
     total_cached_tokens = 0
     total_cache_write_tokens = 0
     total_requests = 0
+    anthropic_input_tokens = 0
+    anthropic_cached_tokens = 0
+    anthropic_cache_write_tokens = 0
 
     for key in all_keys:
         api_key = key.get("api_key")
@@ -234,6 +237,9 @@ async def get_dashboard_stats():
                 total_cached_tokens += int(stats.get("total_cached_tokens", 0) or 0)
                 total_cache_write_tokens += int(stats.get("total_cache_write_tokens", 0) or 0)
                 total_requests += int(stats.get("total_requests", 0) or 0)
+                anthropic_input_tokens += int(stats.get("anthropic_input_tokens", 0) or 0)
+                anthropic_cached_tokens += int(stats.get("anthropic_cached_tokens", 0) or 0)
+                anthropic_cache_write_tokens += int(stats.get("anthropic_cache_write_tokens", 0) or 0)
 
     # Get set of models that have pricing configured (Bedrock model IDs)
     priced_models = {p.get("model_id") for p in all_pricing if p.get("model_id")}
@@ -296,6 +302,9 @@ async def get_dashboard_stats():
         total_cached_tokens=total_cached_tokens,
         total_cache_write_tokens=total_cache_write_tokens,
         total_requests=total_requests,
+        anthropic_input_tokens=anthropic_input_tokens,
+        anthropic_cached_tokens=anthropic_cached_tokens,
+        anthropic_cache_write_tokens=anthropic_cache_write_tokens,
     )
 
 

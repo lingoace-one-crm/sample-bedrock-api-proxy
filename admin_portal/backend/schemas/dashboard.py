@@ -23,6 +23,11 @@ class DashboardStats(BaseModel):
     total_cached_tokens: int = 0
     total_cache_write_tokens: int = 0
     total_requests: int = 0
+    # Anthropic-attributed subset of the totals above — see
+    # ApiKeyResponse for why this split exists.
+    anthropic_input_tokens: int = 0
+    anthropic_cached_tokens: int = 0
+    anthropic_cache_write_tokens: int = 0
 
 
 class DailyModelUsage(BaseModel):
