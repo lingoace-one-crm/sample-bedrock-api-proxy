@@ -9,6 +9,7 @@
     "synth": "cdk synth",
     "deploy": "cdk deploy --all --require-approval never",
     "deploy:dev": "cdk deploy --all --require-approval never -c environment=dev",
+    "deploy:test": "cdk deploy --all --require-approval never -c environment=test",
     "deploy:prod": "cdk deploy --all --require-approval never -c environment=prod",
     "destroy": "cdk destroy --all",
     "diff": "cdk diff"

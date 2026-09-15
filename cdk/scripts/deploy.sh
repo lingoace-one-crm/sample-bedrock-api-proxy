@@ -28,7 +28,7 @@ Usage: $0 [OPTIONS]
 Deploy Anthropic-Bedrock API Proxy to AWS using CDK
 
 OPTIONS:
-    -e, --environment ENV      Environment to deploy (dev|prod) [default: prod]
+    -e, --environment ENV      Environment to deploy (dev|test|prod) [default: prod]
     -r, --region REGION        AWS region [default: us-west-2]
     -p, --platform PLATFORM    Platform architecture (arm64|amd64) [default:arm64]
     -l, --launch-type TYPE     ECS launch type (fargate|ec2) [default: fargate]
@@ -51,6 +51,9 @@ EXAMPLES:
 
     # Deploy to dev with EC2 launch type (enables PTC support)
     ./scripts/deploy.sh -e dev -p arm64 -l ec2
+
+    # Create test environment (same defaults as dev, all infrastructure stacks)
+    ./scripts/deploy.sh -e test -r us-west-2 -p arm64 --all
 
     # Deploy to prod with AMD64 and EC2 for PTC
     ./scripts/deploy.sh -e prod -r us-east-1 -p amd64 -l ec2
@@ -209,8 +212,8 @@ if [[ ! "$PLATFORM" =~ ^(arm64|amd64)$ ]]; then
 fi
 
 # Validate environment
-if [[ ! "$ENVIRONMENT" =~ ^(dev|prod)$ ]]; then
-    echo -e "${RED}Error: Environment must be 'dev' or 'prod'${NC}"
+if [[ ! "$ENVIRONMENT" =~ ^(dev|test|prod)$ ]]; then
+    echo -e "${RED}Error: Environment must be 'dev', 'test' or 'prod'${NC}"
     exit 1
 fi
 
@@ -272,13 +275,13 @@ echo
 # Show EC2 info if using EC2 launch type
 if [[ "$LAUNCH_TYPE" == "ec2" ]]; then
     echo -e "${BLUE}EC2 Launch Type Configuration:${NC}"
-    if [[ "$ENVIRONMENT" == "dev" ]]; then
+    if [[ "$ENVIRONMENT" == "dev" || "$ENVIRONMENT" == "test" ]]; then
         if [[ "$PLATFORM" == "arm64" ]]; then
             echo -e "  Instance Type: ${YELLOW}t4g.medium (ARM64 Graviton)${NC}"
         else
             echo -e "  Instance Type: ${YELLOW}t3.medium (x86_64)${NC}"
         fi
-        echo -e "  Spot Instances: ${YELLOW}Yes (cost savings)${NC}"
+        echo -e "  Spot Instances: ${YELLOW}No (On-Demand, same as dev config)${NC}"
     else
         if [[ "$PLATFORM" == "arm64" ]]; then
             echo -e "  Instance Type: ${YELLOW}t4g.large (ARM64 Graviton)${NC}"

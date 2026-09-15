@@ -127,7 +127,7 @@ export interface EnvironmentConfig {
 // Environment configurations without runtime settings (platform and launchType are set at deployment time)
 type EnvironmentConfigWithoutRuntime = Omit<EnvironmentConfig, 'platform' | 'launchType'>;
 
-export const environments: { [key: string]: EnvironmentConfigWithoutRuntime } = {
+const baseEnvironments: { [key: string]: EnvironmentConfigWithoutRuntime } = {
   dev: {
     region: process.env.AWS_REGION || 'us-west-2',
     environmentName: 'dev',
@@ -375,6 +375,21 @@ export const environments: { [key: string]: EnvironmentConfigWithoutRuntime } = 
       ManagedBy: 'CDK',
     },
   },
+};
+
+// Test follows dev defaults; only resource identity and the VPC address range differ.
+export const environments: { [key: string]: EnvironmentConfigWithoutRuntime } = {
+  dev: baseEnvironments.dev,
+  test: {
+    ...baseEnvironments.dev,
+    environmentName: 'test',
+    vpcCidr: '10.2.0.0/16',
+    tags: {
+      ...baseEnvironments.dev.tags,
+      Environment: 'test',
+    },
+  },
+  prod: baseEnvironments.prod,
 };
 
 // Helper function to get EC2 instance type based on platform

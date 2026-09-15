@@ -22,7 +22,7 @@ export AWS_REGION=us-west-2
 npx cdk bootstrap
 
 # 3. Deploy all stacks (ARM64 recommended for better price-performance)
-./scripts/deploy.sh -e dev -r us-west-2 -p arm64
+./scripts/deploy.sh -e dev -r us-west-2 -p arm64 --all
 
 # 4. Create an API key (with default service tier)
 ./scripts/create-api-key.sh -e dev -u admin@example.com -n "Dev Key"
@@ -35,6 +35,29 @@ curl http://YOUR_ALB_URL/health
 ```
 
 **Time:** ~15-20 minutes for initial deployment
+
+## Quick Deploy (Test)
+
+The supported environments are **dev**, **test**, and **prod**. Test inherits dev's
+resource sizes, scaling limits, and feature defaults, with independent stacks,
+data, credentials, and a separate VPC (`10.2.0.0/16`).
+
+Run from `cdk/` after installing dependencies and bootstrapping the target region:
+
+```bash
+# First deployment must include infrastructure stacks
+./scripts/deploy.sh -e test -r us-west-2 -p arm64 --all
+
+./scripts/create-api-key.sh -e test -r us-west-2 -u admin@example.com -n "Test Key"
+./scripts/create-admin-user.sh -e test -r us-west-2 --email admin@example.com
+
+# Later application-only deployments
+./scripts/deploy.sh -e test -r us-west-2 -p arm64
+```
+
+Use the same region, architecture, launch type (`-l ec2` if applicable), and
+deploy-time feature overrides as dev to match a customized dev deployment.
+All test stacks use the prefix `AnthropicProxy-test-`.
 
 ## Platform Selection
 
@@ -81,10 +104,12 @@ Choose your ECS launch type:
 
 | Environment | ARM64 | AMD64 | Spot Instances |
 |-------------|-------|-------|----------------|
-| dev | t4g.medium | t3.medium | Yes |
+| dev | t4g.medium | t3.medium | No |
+| test | t4g.medium | t3.medium | No |
 | prod | t4g.large | t3.large | No |
 
-**Note:** Dev environments use Spot instances for cost savings. Production uses On-Demand for stability.
+**Note:** All three environments currently use On-Demand instances. Test inherits
+dev's EC2 settings.
 
 ## Quick Deploy (Production)
 

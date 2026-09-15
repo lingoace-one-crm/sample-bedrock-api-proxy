@@ -26,7 +26,7 @@ Usage: $0 [OPTIONS]
 Create an admin user for the Anthropic Proxy Admin Portal (Cognito)
 
 OPTIONS:
-    -e, --environment ENV      Environment (dev|prod) [default: dev]
+    -e, --environment ENV      Environment (dev|test|prod) [default: dev]
     -r, --region REGION        AWS region [default: us-west-2]
     --email EMAIL              User email address (required)
     --password PASSWORD        Temporary password (optional, will be generated if not provided)
@@ -112,8 +112,8 @@ if [[ -z "$EMAIL" ]]; then
 fi
 
 # Validate environment
-if [[ ! "$ENVIRONMENT" =~ ^(dev|prod)$ ]]; then
-    echo -e "${RED}Error: Environment must be 'dev' or 'prod'${NC}"
+if [[ ! "$ENVIRONMENT" =~ ^(dev|test|prod)$ ]]; then
+    echo -e "${RED}Error: Environment must be 'dev', 'test' or 'prod'${NC}"
     exit 1
 fi
 

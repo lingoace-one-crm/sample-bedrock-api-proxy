@@ -25,7 +25,7 @@ Usage: $0 [OPTIONS]
 Create an API key for the Anthropic Proxy service
 
 OPTIONS:
-    -e, --environment ENV    Environment (dev|prod) [default: prod]
+    -e, --environment ENV    Environment (dev|test|prod) [default: prod]
     -r, --region REGION      AWS region [default: us-west-2]
     -u, --user-id ID         User ID (required)
     -n, --name NAME          Key name/description (required)
@@ -108,8 +108,8 @@ if [[ -z "$KEY_NAME" ]]; then
     usage
 fi
 
-if [[ ! "$ENVIRONMENT" =~ ^(dev|prod)$ ]]; then
-    echo -e "${RED}Error: Environment must be 'dev' or 'prod'${NC}"
+if [[ ! "$ENVIRONMENT" =~ ^(dev|test|prod)$ ]]; then
+    echo -e "${RED}Error: Environment must be 'dev', 'test' or 'prod'${NC}"
     exit 1
 fi
 

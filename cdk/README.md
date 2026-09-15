@@ -101,40 +101,39 @@ npm install
 
 ### Environment Configuration
 
-Edit `config/config.ts` to customize environments:
+`config/config.ts` supports three independent environments: **dev**, **test**, and
+**prod**. Test inherits dev's defaults (including future changes), with its own
+environment name, tags, and VPC CIDR. Runtime environment-variable overrides apply
+to the selected environment as usual.
 
-```typescript
-export const environments = {
-  dev: {
-    region: 'us-west-2',
-    ecsDesiredCount: 1,
-    ecsMinCapacity: 1,
-    ecsMaxCapacity: 2,
-    // ... more settings
-  },
-  prod: {
-    region: 'us-west-2',
-    ecsDesiredCount: 2,
-    ecsMinCapacity: 2,
-    ecsMaxCapacity: 10,
-    // ... more settings
-  },
-};
-```
+| Environment | Stack prefix | VPC CIDR | Default region in config |
+|-------------|--------------|----------|--------------------------|
+| dev | `AnthropicProxy-dev` | `10.0.0.0/16` | `us-west-2` |
+| test | `AnthropicProxy-test` | `10.2.0.0/16` | `us-west-2` |
+| prod | `AnthropicProxy-prod` | `10.1.0.0/16` | `us-east-1` |
+
+Each environment gets its own Network, DynamoDB, Cognito, and ECS stacks, including
+separate API keys, admin users, secrets, and logs. Test does not copy dev's data.
+Pass `-r` explicitly to deployment and management scripts to select the same region.
 
 ### Key Configuration Options
 
-| Setting | Dev Default | Prod Default | Description |
+| Setting | Dev / Test Default | Prod Default | Description |
 |---------|-------------|--------------|-------------|
 | `ecsDesiredCount` | 1 | 2 | Initial number of tasks |
-| `ecsCpu` | 512 | 1024 | CPU units per task |
-| `ecsMemory` | 1024 | 2048 | Memory (MB) per task |
+| `ecsCpu` | 1024 | 1024 | CPU units per task |
+| `ecsMemory` | 2048 | 2048 | Memory (MB) per task |
 | `ecsMinCapacity` | 1 | 2 | Min auto-scaling tasks |
 | `ecsMaxCapacity` | 2 | 10 | Max auto-scaling tasks |
-| `maxAzs` | 2 | 3 | Availability zones |
+| `maxAzs` | 2 | 2 | Availability zones |
 | `dynamodbBillingMode` | PAY_PER_REQUEST | PAY_PER_REQUEST | DynamoDB billing |
 
 ## Deployment Options
+
+### Deploy to Test
+
+See [Quick Deploy (Test)](DEPLOYMENT.md#quick-deploy-test) for first-time deployment
+and credential setup. `npm run deploy:test` also deploys all test stacks.
 
 ### Deploy to Production
 
