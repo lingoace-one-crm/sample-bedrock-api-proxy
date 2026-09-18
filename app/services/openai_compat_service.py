@@ -15,6 +15,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncGenerator, Dict, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -102,6 +103,7 @@ class OpenAICompatService:
             timeout=settings.bedrock_timeout,
             **transport_kwargs,
         )
+        self._base_url = str(resolved_base_url).rstrip("/")
         self.request_converter = AnthropicToOpenAIConverter()
         self.response_converter = OpenAIToAnthropicConverter()
         self.responses_request_converter = AnthropicToOpenAIResponsesConverter()
@@ -274,6 +276,37 @@ class OpenAICompatService:
                 request_id,
             )
 
+    # bedrock-mantle serves gpt-5.x on /openai/v1 and the open-weight gpt-oss family on /v1. When ENABLE_OPENAI_COMPAT
+    # points at a Mantle /v1 base URL (env.example default), a gpt-5.x request forced onto the Responses API would
+    # otherwise hit /v1/responses and 404. We maintain this path swap locally rather than reuse openai_passthrough.client
+    # so the compat and passthrough routing chains stay independently trackable. The swap is gated on a bedrock-mantle
+    # host so Runtime and custom endpoints (which may also end in /v1 or /openai/v1) are never rewritten.
+    _MANTLE_OPENAI_PREFIX = "/openai/v1"
+    _MANTLE_PLAIN_PREFIX = "/v1"
+
+    def _responses_client(self, model: str | None):
+        """Return an OpenAI client whose base URL path matches this model.
+
+        Only bedrock-mantle base URLs are rewritten (gpt-5.x -> /openai/v1,
+        gpt-oss -> /v1); Runtime and custom endpoints are used unchanged even
+        when their path happens to end in one of the two prefixes.
+        """
+        base = self._base_url
+        if not model or "bedrock-mantle" not in (urlsplit(base).hostname or ""):
+            return self.client
+        for prefix in (self._MANTLE_OPENAI_PREFIX, self._MANTLE_PLAIN_PREFIX):
+            if not base.endswith(prefix):
+                continue
+            wanted = (
+                self._MANTLE_PLAIN_PREFIX
+                if model.startswith("openai.gpt-oss")
+                else self._MANTLE_OPENAI_PREFIX
+            )
+            if prefix == wanted:
+                return self.client
+            return self.client.copy(base_url=base[: -len(prefix)] + wanted)
+        return self.client
+
     def invoke_responses_sync(
         self, request: MessageRequest, request_id: Optional[str] = None
     ) -> MessageResponse:
@@ -303,7 +336,7 @@ class OpenAICompatService:
         print(f"  - Request ID: {request_id}")
 
         try:
-            response = self.client.responses.create(**kwargs)
+            response = self._responses_client(request.model).responses.create(**kwargs)
             resp_dict = response.model_dump()
 
             anthropic_response = self.responses_response_converter.convert_response(
@@ -419,7 +452,7 @@ class OpenAICompatService:
                     return
                 kwargs = self.responses_request_converter.convert_request(request)
                 kwargs["stream"] = True
-                stream = self.client.responses.create(**kwargs)
+                stream = self._responses_client(request.model).responses.create(**kwargs)
                 with stream_lock:
                     active_stream.append(stream)
                 if cancelled.is_set():

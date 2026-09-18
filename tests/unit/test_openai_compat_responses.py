@@ -63,6 +63,9 @@ def _make_service_with_fake_response(resp_dict: dict[str, Any]):
         fake_response = MagicMock(name="responses_response")
         fake_response.model_dump.return_value = resp_dict
         fake_client.responses.create.return_value = fake_response
+        # A Mantle /v1 base URL + gpt-5.x model triggers client.copy(base_url=...)
+        # for the path swap; the swapped client must behave like the original.
+        fake_client.copy.return_value = fake_client
 
         svc = OpenAICompatService()
         return svc, fake_client
@@ -232,3 +235,45 @@ def test_sync_real_sdk_rejects_error_in_successful_http_response(body):
         )
         with pytest.raises(BedrockAPIError):
             service.invoke_responses_sync(_request())
+
+
+# ---------------------------------------------------------------------------
+# Mantle path swap: gpt-5.x on a /v1 base URL must be sent to /openai/v1
+# (Mantle serves gpt-5.x there); gpt-oss stays on /v1.
+# ---------------------------------------------------------------------------
+
+
+def _make_request(model: str) -> MessageRequest:
+    return MessageRequest(
+        model=model, messages=[Message(role="user", content="hi")], max_tokens=16
+    )
+
+
+def test_gpt5_on_mantle_v1_base_swaps_to_openai_v1():
+    svc, fake_client = _make_service_with_fake_response(_responses_dict())
+    svc._base_url = "https://bedrock-mantle.us-west-2.api.aws/v1"
+
+    svc.invoke_responses_sync(_make_request("openai.gpt-5.4"))
+
+    fake_client.copy.assert_called_once_with(
+        base_url="https://bedrock-mantle.us-west-2.api.aws/openai/v1"
+    )
+
+
+def test_gpt_oss_on_mantle_v1_base_stays_on_v1():
+    svc, fake_client = _make_service_with_fake_response(_responses_dict())
+    svc._base_url = "https://bedrock-mantle.us-west-2.api.aws/v1"
+
+    svc.invoke_responses_sync(_make_request("openai.gpt-oss-120b"))
+
+    fake_client.copy.assert_not_called()
+
+
+def test_non_mantle_endpoint_path_is_never_swapped():
+    """A custom/Runtime endpoint ending in /v1 must not be rewritten to /openai/v1."""
+    svc, fake_client = _make_service_with_fake_response(_responses_dict())
+    svc._base_url = "https://custom.example.com/custom/v1"
+
+    svc.invoke_responses_sync(_make_request("openai.gpt-5.4"))
+
+    fake_client.copy.assert_not_called()

@@ -562,6 +562,16 @@ class Settings(BaseSettings):
             "OPENAI_BASE_URL is also accepted; MANTLE_ENDPOINT_URL takes precedence."
         )
     )
+    openai_compat_responses_model_prefixes: list[str] = Field(
+        default=["gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-6"],
+        alias="OPENAI_COMPAT_RESPONSES_MODEL_PREFIXES",
+        description=(
+            "Non-Claude model-id substrings that only serve Mantle's Responses API "
+            "(not Chat Completions). Matched against the resolved/mapped Bedrock id, "
+            "so both aliases ('gpt-5.4') and mapped ids ('openai.gpt-5.4') are caught. "
+            "Defaults cover the gpt-5.x family; extend via env without a code change."
+        ),
+    )
     openai_compat_thinking_high_threshold: int = Field(
         default=10000,
         alias="OPENAI_COMPAT_THINKING_HIGH_THRESHOLD",

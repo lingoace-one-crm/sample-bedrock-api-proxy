@@ -259,8 +259,27 @@ class BedrockService:
         if service:
             return service, True, request.model_copy(update={"model": model_id})
         if self._openai_compat_service:
-            return self._openai_compat_service, self._openai_use_responses, request
+            # Forward the MAPPED id upstream (the converter serializes request.model verbatim into the Chat/Responses payload); 
+            # otherwise DynamoDB/default mappings are silently dropped and Mantle 404s on the client alias.
+            # The response's model name is restored to request.model by the callers.
+            upstream_request = request.model_copy(update={"model": model_id})
+            use_responses = self._openai_use_responses or self._requires_responses_api(model_id)
+            return self._openai_compat_service, use_responses, upstream_request
         return None
+
+    def _requires_responses_api(self, model_id: str) -> bool:
+        """Whether this non-Claude model only serves Mantle's Responses API.
+
+        gpt-5.x/gpt-6.x on Mantle rejects Chat Completions ("isn't supported on this route"),
+        so those models must use invoke_responses regardless of openai_use_responses.
+        Matched on the resolved id so raw aliases ('gpt-5.4') and mapped ids ('openai.gpt-5.4') both hit; 
+        the prefix list is env-configurable.
+        """
+        resolved = get_inference_profile_resolver().resolve(model_id).lower()
+        return any(
+            prefix in resolved
+            for prefix in settings.openai_compat_responses_model_prefixes
+        )
 
     def _is_claude_model(self, model_id: str) -> bool:
         """
