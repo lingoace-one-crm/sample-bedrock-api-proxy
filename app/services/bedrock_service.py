@@ -1378,7 +1378,7 @@ class BedrockService:
                 )
 
             # Consume events from queue asynchronously
-            _ping_interval = 30  # seconds between ping events
+            _ping_interval = 20  # seconds between ping events
             _last_yield_time = time.monotonic()
 
             try:
