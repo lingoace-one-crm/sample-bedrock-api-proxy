@@ -34,3 +34,6 @@ cdk/cdk.context.json
 .idea
 
 cdk/scripts/
+
+# Trellis local workflow state
+.trellis/

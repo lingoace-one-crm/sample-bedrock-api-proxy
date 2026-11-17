@@ -38,6 +38,14 @@ export class NetworkStack extends cdk.Stack {
               subnetType: ec2.SubnetType.PUBLIC,
               cidrMask: 24,
             },
+            // A VPC first created with maxAzs=3 has Public x.0-2/24 and Private
+            // x.3-5/24. Shrinking it to 2 AZs would recompute Private as x.2-3/24
+            // and force replacement of live, cross-stack-exported subnets (which
+            // CloudFormation rejects). Two reserved /25s (never created) occupy
+            // x.2.0/24 so Private stays at x.3-4/24 and AZ a/b subnets are kept.
+            ...(config.vpcLegacy3AzCidrs
+              ? [{ name: 'Reserved', subnetType: ec2.SubnetType.PRIVATE_ISOLATED, cidrMask: 25, reserved: true }]
+              : []),
             {
               name: 'Private',
               subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
@@ -56,19 +64,35 @@ export class NetworkStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    // Allow HTTP from anywhere
-    this.albSecurityGroup.addIngressRule(
-      ec2.Peer.anyIpv4(),
-      ec2.Port.tcp(80),
-      'Allow HTTP from anywhere'
-    );
+    if (config.enableCloudFront && !usePublicSubnets) {
+      // The ALB is internal and fronted by a CloudFront VPC origin. Only accept
+      // traffic from CloudFront's origin-facing ranges (AWS-managed prefix list),
+      // on the single HTTP listener port. Nothing else may reach the ALB.
+      // NOTE: this prefix list carries a large rule weight; keep it to ONE rule
+      // per security group (see "AWS-managed prefix list weight" in the VPC docs).
+      const cloudFrontOriginFacing = ec2.PrefixList.fromLookup(this, 'CloudFrontOriginFacing', {
+        prefixListName: 'com.amazonaws.global.cloudfront.origin-facing',
+      });
+      this.albSecurityGroup.addIngressRule(
+        ec2.Peer.prefixList(cloudFrontOriginFacing.prefixListId),
+        ec2.Port.tcp(80),
+        'Allow HTTP from CloudFront origin-facing servers (VPC origin) only'
+      );
+    } else {
+      // Internet-facing ALB: direct mode (testing only, plain HTTP), or USE_PUBLIC_SUBNETS with CloudFront as an HTTP
+      // origin, where the listener's secret-header rule rejects direct requests.
+      this.albSecurityGroup.addIngressRule(
+        ec2.Peer.anyIpv4(),
+        ec2.Port.tcp(80),
+        'Allow HTTP from anywhere'
+      );
 
-    // Allow HTTPS from anywhere
-    this.albSecurityGroup.addIngressRule(
-      ec2.Peer.anyIpv4(),
-      ec2.Port.tcp(443),
-      'Allow HTTPS from anywhere'
-    );
+      this.albSecurityGroup.addIngressRule(
+        ec2.Peer.anyIpv4(),
+        ec2.Port.tcp(443),
+        'Allow HTTPS from anywhere'
+      );
+    }
 
     // Security Group for ECS Tasks
     this.ecsSecurityGroup = new ec2.SecurityGroup(this, 'ECSSecurityGroup', {

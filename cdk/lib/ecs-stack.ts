@@ -46,6 +46,10 @@ export class ECSStack extends cdk.Stack {
   public taskDefinition: ecs.TaskDefinition;
   public distribution?: cloudfront.Distribution;
   private adminTargetGroup?: elbv2.ApplicationTargetGroup;
+  /** Construct-ID suffix for load-balancer resources ('Private' in CloudFront mode). */
+  private readonly lbIdSuffix: string;
+  /** PROVIDER_KEY_ENCRYPTION_SECRET, injected into proxy and admin containers. */
+  private readonly providerKeyEncryptionSecret: secretsmanager.Secret;
 
   constructor(scope: Construct, id: string, props: ECSStackProps) {
     super(scope, id, props);
@@ -71,24 +75,53 @@ export class ECSStack extends cdk.Stack {
     }
 
     // Create ALB
-    this.alb = new elbv2.ApplicationLoadBalancer(this, 'ALB', {
-      loadBalancerName: `anthropic-proxy-${config.environmentName}-alb`,
+    // With CloudFront enabled the ALB is internal (private subnets) and CloudFront
+    // reaches it through a VPC origin, so origin traffic never crosses the public
+    // internet and the ALB has no internet-facing endpoint. Without CloudFront the
+    // ALB must be internet-facing and serves plain HTTP (testing only).
+    //
+    // Construct IDs and the ALB name differ per mode so switching an existing stack
+    // creates a fresh ALB / listener / target-group set instead of an in-place
+    // replacement, which CloudFormation cannot do here (custom-named ALBs cannot be
+    // replaced, and a target group cannot be attached to two load balancers).
+    // USE_PUBLIC_SUBNETS=true builds a VPC without private subnets, so the ALB stays internet-facing in public subnets
+    // and CloudFront reaches it as a plain HTTP origin guarded by the secret header (the pre-VPC-origin layout).
+    const usePublicSubnets = process.env.USE_PUBLIC_SUBNETS === 'true';
+    const privateAlb = config.enableCloudFront && !usePublicSubnets;
+    const albSubnets = privateAlb ? vpc.privateSubnets : vpc.publicSubnets;
+    this.lbIdSuffix = privateAlb ? 'Private' : '';
+    this.alb = new elbv2.ApplicationLoadBalancer(this, `ALB${this.lbIdSuffix}`, {
+      loadBalancerName: `anthropic-proxy-${config.environmentName}-${privateAlb ? 'ialb' : 'alb'}`,
       vpc,
-      internetFacing: true,
+      internetFacing: !privateAlb,
       securityGroup: albSecurityGroup,
       vpcSubnets: {
-        subnetType: ec2.SubnetType.PUBLIC,
+        subnets: albSubnets,
       },
       deletionProtection: false,
       idleTimeout: cdk.Duration.seconds(1800),
     });
+
+    if (!config.enableCloudFront) {
+      cdk.Annotations.of(this).addWarningV2(
+        'anthropic-proxy:alb-plain-http',
+        'enableCloudFront is false: the internet-facing ALB serves plain HTTP, so API keys ' +
+        'and prompts travel unencrypted. Use this mode for testing only; enable CloudFront ' +
+        '(HTTPS + private ALB via VPC origin) for any real deployment.'
+      );
+    }
+
+    // Source-IP authorization relies on right-anchored append-only XFF.
+    // Keep ports disabled: the application accepts IP literals, not host:port.
+    this.alb.setAttribute('routing.http.xff_header_processing.mode', 'append');
+    this.alb.setAttribute('routing.http.xff_client_port.enabled', 'false');
 
     // Create Target Group - target type depends on launch type
     const targetType = config.launchType === 'ec2'
       ? elbv2.TargetType.INSTANCE
       : elbv2.TargetType.IP;
 
-    const targetGroup = new elbv2.ApplicationTargetGroup(this, 'TargetGroup', {
+    const targetGroup = new elbv2.ApplicationTargetGroup(this, `TargetGroup${this.lbIdSuffix}`, {
       vpc,
       port: config.containerPort,
       protocol: elbv2.ApplicationProtocol.HTTP,
@@ -108,9 +141,13 @@ export class ECSStack extends cdk.Stack {
     });
 
     // Create HTTP Listener
-    this.listener = this.alb.addListener('HTTPListener', {
+    this.listener = this.alb.addListener(`HTTPListener${this.lbIdSuffix}`, {
       port: 80,
       protocol: elbv2.ApplicationProtocol.HTTP,
+      // `open` defaults to true, which adds a 0.0.0.0/0 ingress rule to the ALB
+      // security group. With a private ALB NetworkStack admits only the CloudFront
+      // origin-facing prefix list, so the listener must not re-open the port.
+      open: !privateAlb,
       defaultTargetGroups: [targetGroup],
     });
 
@@ -149,16 +186,70 @@ export class ECSStack extends cdk.Stack {
     responseContextTable.grantReadWriteData(taskRole);
     speedTestsTable.grantReadWriteData(taskRole);
 
-    // Grant Bedrock permissions
+    // Grant Bedrock permissions, scoped to Bedrock model resource types rather
+    // than '*'. Model IDs are resolved at runtime (remote model mapping, admin
+    // overrides, client-supplied ARNs), so resources are scoped by type:
+    //   - foundation models in any Region (geographic cross-Region inference
+    //     routes to destination Regions) and the Region-less ARN used by global
+    //     cross-Region inference;
+    //   - this account's inference profiles and custom/provisioned/imported models.
+    // For production, narrow these further to the model IDs you actually serve.
+    const bedrockAccountArn = (resource: string) =>
+      `arn:${cdk.Aws.PARTITION}:bedrock:*:${cdk.Aws.ACCOUNT_ID}:${resource}`;
     taskRole.addToPolicy(
       new iam.PolicyStatement({
+        sid: 'BedrockInvokeModels',
         effect: iam.Effect.ALLOW,
         actions: [
           'bedrock:InvokeModel',
           'bedrock:InvokeModelWithResponseStream',
-          'bedrock:ListFoundationModels',
-          'bedrock:GetInferenceProfile',
         ],
+        resources: [
+          `arn:${cdk.Aws.PARTITION}:bedrock:*::foundation-model/*`,
+          `arn:${cdk.Aws.PARTITION}:bedrock:::foundation-model/*`,
+          bedrockAccountArn('inference-profile/*'),
+          bedrockAccountArn('application-inference-profile/*'),
+          bedrockAccountArn('provisioned-model/*'),
+          bedrockAccountArn('imported-model/*'),
+          bedrockAccountArn('custom-model-deployment/*'),
+        ],
+      })
+    );
+    // The Runtime Responses API (/openai/v1/responses on bedrock-runtime) also
+    // authorizes bedrock:InvokeModel on the account's project (normally
+    // project/default), and stored-response operations on that project.
+    // Without this, SigV4 calls fail with 401 and CloudTrail shows AccessDenied
+    // on arn:aws:bedrock:<region>:<account>:project/default.
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'BedrockRuntimeResponsesProject',
+        effect: iam.Effect.ALLOW,
+        actions: [
+          'bedrock:InvokeModel',
+          'bedrock:GetInvoke',
+          'bedrock:CancelInvoke',
+          'bedrock:DeleteInvoke',
+        ],
+        resources: [bedrockAccountArn('project/*')],
+      })
+    );
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'BedrockGetInferenceProfile',
+        effect: iam.Effect.ALLOW,
+        actions: ['bedrock:GetInferenceProfile'],
+        resources: [
+          bedrockAccountArn('inference-profile/*'),
+          bedrockAccountArn('application-inference-profile/*'),
+        ],
+      })
+    );
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'BedrockListFoundationModels',
+        effect: iam.Effect.ALLOW,
+        // ListFoundationModels does not support resource-level permissions.
+        actions: ['bedrock:ListFoundationModels'],
         resources: ['*'],
       })
     );
@@ -219,6 +310,22 @@ export class ECSStack extends cdk.Stack {
     // Grant read access to secret
     masterApiKeySecret.grantRead(taskRole);
 
+    // Encryption key for provider credentials stored in DynamoDB (multi-provider
+    // providers + provider key pool). Without it the application refuses to
+    // store provider credentials. Retained in prod: deleting it would make every
+    // stored provider credential undecryptable.
+    this.providerKeyEncryptionSecret = new secretsmanager.Secret(this, 'ProviderKeyEncryptionSecret', {
+      secretName: `anthropic-proxy-${config.environmentName}-provider-key-encryption`,
+      description: 'Encryption key for provider credentials stored in DynamoDB',
+      generateSecretString: {
+        excludePunctuation: true,
+        passwordLength: 48,
+      },
+      removalPolicy: config.environmentName === 'prod'
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
+    });
+
     // Map platform string to ECS CpuArchitecture
     const cpuArchitecture = config.platform === 'arm64'
       ? ecs.CpuArchitecture.ARM64
@@ -256,6 +363,13 @@ export class ECSStack extends cdk.Stack {
       // Authentication
       API_KEY_HEADER: 'x-api-key',
       REQUIRE_API_KEY: config.requireApiKey.toString(),
+      // Only ALB peers reach tasks (NetworkStack ALB-only SG); trust exactly the
+      // subnets the ALB nodes live in (private with CloudFront, public without).
+      // Two hops additionally requires the secret-protected listener below;
+      // never mix a direct ALB forwarding rule into CloudFront mode.
+      CLIENT_IP_TRUSTED_PROXY_CIDRS: albSubnets
+        .map(subnet => subnet.ipv4CidrBlock).join(','),
+      CLIENT_IP_TRUSTED_PROXY_HOPS: config.enableCloudFront ? '2' : '1',
 
       // Rate Limiting
       RATE_LIMIT_ENABLED: config.rateLimitEnabled.toString(),
@@ -424,13 +538,24 @@ export class ECSStack extends cdk.Stack {
           ? { domainNames: [customDomain], certificate: customCert }
           : {}),
         defaultBehavior: {
-          origin: new origins.HttpOrigin(this.alb.loadBalancerDnsName, {
-            protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY,
-            readTimeout: cdk.Duration.seconds(config.cloudFrontOriginReadTimeout),
-            customHeaders: {
-              'X-CloudFront-Secret': cloudFrontSecret.secretValue.unsafeUnwrap(),
-            },
-          }),
+          // VPC origin: CloudFront connects to the internal ALB over the AWS
+          // network via service-managed ENIs in the ALB's private subnets.
+          origin: privateAlb
+            ? origins.VpcOrigin.withApplicationLoadBalancer(this.alb, {
+                protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+                httpPort: 80,
+                readTimeout: cdk.Duration.seconds(config.cloudFrontOriginReadTimeout),
+                customHeaders: {
+                  'X-CloudFront-Secret': cloudFrontSecret.secretValue.unsafeUnwrap(),
+                },
+              })
+            : new origins.HttpOrigin(this.alb.loadBalancerDnsName, {
+                protocolPolicy: cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+                readTimeout: cdk.Duration.seconds(config.cloudFrontOriginReadTimeout),
+                customHeaders: {
+                  'X-CloudFront-Secret': cloudFrontSecret.secretValue.unsafeUnwrap(),
+                },
+              }),
           viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
           cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
@@ -441,6 +566,13 @@ export class ECSStack extends cdk.Stack {
       });
 
       this.distribution = distribution;
+
+      // When an existing stack moves to the private ALB, only repoint CloudFront
+      // after the proxy service has registered healthy tasks in the new target
+      // group (CloudFormation waits for ECS service stability), avoiding a 5xx
+      // window. The admin service cannot be added here: its PROXY_BASE_URL
+      // references this distribution, which would create a dependency cycle.
+      distribution.node.addDependency(this.service);
 
       // Modify ALB listener: change default action to reject requests without the secret header
       const cfnListener = this.listener.node.defaultChild as elbv2.CfnListener;
@@ -541,7 +673,11 @@ export class ECSStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'ALBDNSName', {
       value: this.alb.loadBalancerDnsName,
-      description: 'ALB DNS Name',
+      description: privateAlb
+        ? 'ALB DNS Name (internal; reachable only through CloudFront)'
+        : config.enableCloudFront
+        ? 'ALB DNS Name (internet-facing; requests without the CloudFront secret header get 403)'
+        : 'ALB DNS Name (internet-facing, plain HTTP - testing only)',
     });
 
     new cdk.CfnOutput(this, 'ALBARN', {
@@ -608,6 +744,7 @@ export class ECSStack extends cdk.Stack {
       environment: environmentVars,
       secrets: {
         MASTER_API_KEY: ecs.Secret.fromSecretsManager(masterApiKeySecret, 'password'),
+        PROVIDER_KEY_ENCRYPTION_SECRET: ecs.Secret.fromSecretsManager(this.providerKeyEncryptionSecret),
       },
       portMappings: [
         {
@@ -812,6 +949,7 @@ export class ECSStack extends cdk.Stack {
       environment: environmentVars,
       secrets: {
         MASTER_API_KEY: ecs.Secret.fromSecretsManager(masterApiKeySecret, 'password'),
+        PROVIDER_KEY_ENCRYPTION_SECRET: ecs.Secret.fromSecretsManager(this.providerKeyEncryptionSecret),
       },
       memoryReservationMiB: config.ecsMemory,
       cpu: config.ecsCpu,
@@ -1012,6 +1150,9 @@ export class ECSStack extends cdk.Stack {
         logGroup: adminLogGroup,
       }),
       environment: adminEnvVars,
+      secrets: {
+        PROVIDER_KEY_ENCRYPTION_SECRET: ecs.Secret.fromSecretsManager(this.providerKeyEncryptionSecret),
+      },
       portMappings: [
         {
           containerPort: config.adminPortalContainerPort,
@@ -1031,7 +1172,7 @@ export class ECSStack extends cdk.Stack {
     });
 
     // Create Admin Portal Target Group
-    const adminTargetGroup = new elbv2.ApplicationTargetGroup(this, 'AdminPortalTargetGroup', {
+    const adminTargetGroup = new elbv2.ApplicationTargetGroup(this, `AdminPortalTargetGroup${this.lbIdSuffix}`, {
       vpc,
       port: config.adminPortalContainerPort,
       protocol: elbv2.ApplicationProtocol.HTTP,
@@ -1125,7 +1266,7 @@ export class ECSStack extends cdk.Stack {
     if (!config.enableCloudFront) {
       new cdk.CfnOutput(this, 'AdminPortalURL', {
         value: `http://${this.alb.loadBalancerDnsName}/admin/`,
-        description: 'Admin Portal URL',
+        description: 'Admin Portal URL (plain HTTP - testing only; enable CloudFront for HTTPS)',
       });
     }
   }

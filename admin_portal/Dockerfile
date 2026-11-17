@@ -5,7 +5,7 @@
 #   docker build -f admin_portal/Dockerfile -t admin-portal .
 
 # Stage 1: Build Frontend
-FROM node:20-slim AS frontend-builder
+FROM public.ecr.aws/docker/library/node:20-slim AS frontend-builder
 
 WORKDIR /build
 
@@ -23,9 +23,12 @@ ENV VITE_BASE_PATH=/admin/
 RUN npm run build
 
 # Stage 2: Python Dependencies
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm AS builder
 
 WORKDIR /build
+
+# uv is pinned and installed from PyPI; base image comes from ECR Public
+RUN pip install --no-cache-dir "uv==0.12.6"
 
 # Increase HTTP timeout for dependency downloads (matches root Dockerfile);
 # default 30s is too short for larger wheels (grpcio, cryptography, botocore)
@@ -45,8 +48,8 @@ COPY admin_portal/backend ./admin_portal/backend
 # Install dependencies
 RUN uv sync --frozen --no-dev
 
-# Stage 3: Final Runtime
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+# Stage 3: Final Runtime (uv is not needed at runtime)
+FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
 
 WORKDIR /app
 

@@ -32,6 +32,12 @@ from botocore.exceptions import ClientError, ParamValidationError
 from app.converters.anthropic_to_bedrock import AnthropicToBedrockConverter
 from app.converters.bedrock_to_anthropic import BedrockToAnthropicConverter
 from app.converters.converse_compat import ConverseRequestAdapter
+from app.core.access_policy import (
+    UNRESTRICTED_POLICY,
+    AccessPolicyDenied,
+    ParsedAccessPolicy,
+    require_model,
+)
 from app.core.config import settings
 from app.core.exceptions import BedrockAPIError, map_bedrock_error
 from app.schemas.anthropic import CountTokensRequest, MessageRequest, MessageResponse
@@ -46,6 +52,7 @@ from app.services.bedrock_openai import (
 from app.services.inference_profile_resolver import (
     get_inference_profile_resolver,
 )
+from app.services.model_access import ModelAPI, PreparedModel
 
 logger = logging.getLogger(__name__)
 
@@ -250,9 +257,70 @@ class BedrockService:
             self._responses_services[cache_key] = (service, time.monotonic())
             return service
 
-    def _openai_route(self, request: MessageRequest, provider_id=None):
+    def prepare_model(self, model: str, policy: ParsedAccessPolicy) -> PreparedModel:
+        """Resolve once without opening an inference client; authorize the wire ID."""
+        target = self._get_bedrock_model_id(model)
+        # Profile classification may query the control plane. Reject a request
+        # first if neither possible wire ID is permitted. Old compat alone can
+        # send the original name; scoped Runtime routing cannot take that path.
+        legacy_compat_possible = self._openai_compat_service and not (
+            settings.enable_bedrock_responses and is_runtime_model(target)
+        )
+        if not policy.allows_model(target) and not (
+            legacy_compat_possible and policy.allows_model(model)
+        ):
+            require_model(policy, target)
+        api: ModelAPI
+        if self._is_claude_model(target):
+            api = "native"
+        elif settings.enable_bedrock_responses and is_runtime_model(target):
+            api = "runtime"
+        elif self._openai_compat_service:
+            # Historical Mantle compatibility intentionally sends the ORIGINAL ID.
+            target = model
+            api = "responses" if self._openai_use_responses else "chat"
+        else:
+            api = "converse"
+        require_model(policy, target)
+        return PreparedModel(target, api)
+
+    def prepare_count_model(self, model: str, policy: ParsedAccessPolicy) -> PreparedModel:
+        # CountTokens uses Converse based on the ORIGINAL name, even when the
+        # inference adapter would send that name unchanged to old Mantle compat.
+        if "claude" in model.lower() or "anthropic" in model.lower():
+            target = self._get_bedrock_model_id(model)
+            require_model(policy, target)
+            return PreparedModel(target, "converse")
+        return self.prepare_model(model, policy)
+
+    def _prepared(self, request, policy, prepared):
+        if prepared is None and policy.model_enabled:
+            prepared = self.prepare_model(request.model, policy)
+        if prepared is not None:
+            require_model(policy, prepared.target)
+        return prepared
+
+    def _converse_request(self, request, beta, prepared):
+        if prepared is None:
+            return self.anthropic_to_bedrock.convert_request(request, beta)
+        # Converter caches model-specific capabilities on itself. Restricted work
+        # uses a private converter so concurrent requests cannot swap that state.
+        converter = AnthropicToBedrockConverter(self.dynamodb_client)
+        return converter.convert_request(request, beta, resolved_model_id=prepared.target)
+
+    def _openai_route(self, request: MessageRequest, provider_id=None, prepared_model=None):
         """Resolve mapping before choosing the API, retaining the original request."""
         provider_id = provider_id or self._default_provider_id
+        if prepared_model is not None:
+            if prepared_model.api in ("native", "converse"):
+                return None
+            service = (
+                self._responses_service_for_model(prepared_model.target, provider_id)
+                if prepared_model.api == "runtime" else self._openai_compat_service
+            )
+            if service is None:
+                raise BedrockAPIError("Unavailable", "Prepared model backend unavailable", 503)
+            return service, prepared_model.api != "chat", request.model_copy(update={"model": prepared_model.target})
         model_id = self._get_bedrock_model_id(request.model)
         if self._is_claude_model(model_id):
             return None
@@ -301,7 +369,7 @@ class BedrockService:
             self._provider_manager = ProviderManager(
                 dynamodb_resource=self.dynamodb_client.dynamodb,
                 table_name=settings.dynamodb_providers_table,
-                encryption_secret=settings.provider_key_encryption_secret or "",
+                encryption_secret=settings.provider_key_encryption_secret,
             )
         return self._provider_manager
 
@@ -420,6 +488,12 @@ class BedrockService:
             "messages": [],
         }
 
+        # Debug: summarize assistant content types (thinking block ordering) in
+        # one line per request instead of two lines per history message.
+        debug_assistant_types = logger.isEnabledFor(logging.DEBUG)
+        assistant_msg_count = 0
+        rewritten_assistant_types: list[str] = []
+
         # Convert messages
         for msg_idx, msg in enumerate(request.messages):
             message_dict: Dict[str, Any] = {"role": msg.role}
@@ -428,9 +502,9 @@ class BedrockService:
             if isinstance(msg.content, str):
                 message_dict["content"] = msg.content
             else:
-                # Debug: Log content types BEFORE conversion to see Pydantic's order
-                if msg.role == "assistant":
-                    pre_convert_types = []
+                # Debug: capture content types BEFORE conversion to see Pydantic's order
+                pre_convert_types: list[str] = []
+                if debug_assistant_types and msg.role == "assistant":
                     for b in msg.content:
                         if hasattr(b, "type"):
                             pre_convert_types.append(b.type)
@@ -438,7 +512,6 @@ class BedrockService:
                             pre_convert_types.append(b.get("type", "?"))
                         else:
                             pre_convert_types.append(type(b).__name__)
-                    print(f"[BEDROCK NATIVE CONVERT] msg[{msg_idx}] assistant BEFORE convert: {pre_convert_types}")
 
                 # Convert content blocks to native format
                 content_list = []
@@ -516,10 +589,14 @@ class BedrockService:
                     content_list.append(block_dict)
                 message_dict["content"] = content_list
 
-                # Debug: Log content types for assistant messages to debug thinking block ordering
-                if msg.role == "assistant":
+                # Debug: record assistant messages whose block types changed in conversion
+                if debug_assistant_types and msg.role == "assistant":
+                    assistant_msg_count += 1
                     content_types = [b.get("type", "?") for b in content_list]
-                    print(f"[BEDROCK NATIVE CONVERT] msg[{msg_idx}] assistant content_types: {content_types}")
+                    if content_types != pre_convert_types:
+                        rewritten_assistant_types.append(
+                            f"msg[{msg_idx}] {pre_convert_types} -> {content_types}"
+                        )
 
             if msg.role == "system":
                 content = message_dict["content"]
@@ -535,6 +612,14 @@ class BedrockService:
             if msg.role == "assistant" and not message_dict["content"]:
                 continue
             native_request["messages"].append(message_dict)
+
+        if assistant_msg_count:
+            logger.debug(
+                "[BEDROCK NATIVE CONVERT] %d assistant messages, %d rewritten%s",
+                assistant_msg_count,
+                len(rewritten_assistant_types),
+                ": " + "; ".join(rewritten_assistant_types) if rewritten_assistant_types else "",
+            )
 
         # Add system message
         if request.system:
@@ -805,7 +890,9 @@ class BedrockService:
     async def invoke_model(
         self, request: MessageRequest, request_id: Optional[str] = None,
         service_tier: Optional[str] = None, anthropic_beta: Optional[str] = None,
-        cache_ttl: Optional[str] = None, provider_id: Optional[str] = None
+        cache_ttl: Optional[str] = None, provider_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
+        prepared_model: PreparedModel | None = None,
     ) -> MessageResponse:
         """
         Invoke Bedrock model (non-streaming) asynchronously.
@@ -827,11 +914,12 @@ class BedrockService:
         """
         # Route non-Claude models to OpenAI-compat BEFORE acquiring Bedrock semaphore
         # (OpenAI-compat service manages its own semaphore)
-        route = self._openai_route(request, provider_id)
+        prepared_model = self._prepared(request, access_policy, prepared_model)
+        route = self._openai_route(request, provider_id, prepared_model)
         if route:
             service, responses, upstream_request = route
             invoke = service.invoke_responses if responses else service.invoke_model
-            result: MessageResponse = await invoke(upstream_request, request_id)
+            result: MessageResponse = await invoke(upstream_request, request_id, **({"access_policy": access_policy} if access_policy.model_enabled else {}))
             result.model = request.model
             return result
 
@@ -855,14 +943,18 @@ class BedrockService:
                 anthropic_beta,
                 _otel_ctx,
                 cache_ttl,
-                provider_id
+                provider_id,
+                access_policy,
+                prepared_model,
             )
 
     def _invoke_model_sync(
         self, request: MessageRequest, request_id: Optional[str] = None,
         service_tier: Optional[str] = None, anthropic_beta: Optional[str] = None,
         otel_ctx=None, cache_ttl: Optional[str] = None,
-        provider_id: Optional[str] = None
+        provider_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
+        prepared_model: PreparedModel | None = None,
     ) -> MessageResponse:
         """
         Synchronous Bedrock model invocation (runs in thread pool).
@@ -889,7 +981,7 @@ class BedrockService:
             _otel_token = attach_context_in_thread(otel_ctx)
 
         try:
-            return self._invoke_model_sync_inner(request, request_id, service_tier, anthropic_beta, cache_ttl=cache_ttl, provider_id=provider_id)
+            return self._invoke_model_sync_inner(request, request_id, service_tier, anthropic_beta, cache_ttl=cache_ttl, provider_id=provider_id, access_policy=access_policy, prepared_model=prepared_model)
         finally:
             if _otel_token is not None:
                 from app.tracing.context import detach_context_in_thread
@@ -898,25 +990,29 @@ class BedrockService:
     def _invoke_model_sync_inner(
         self, request: MessageRequest, request_id: Optional[str] = None,
         service_tier: Optional[str] = None, anthropic_beta: Optional[str] = None,
-        cache_ttl: Optional[str] = None, provider_id: Optional[str] = None
+        cache_ttl: Optional[str] = None, provider_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
+        prepared_model: PreparedModel | None = None,
     ) -> MessageResponse:
         """Inner sync invocation after OTEL context is attached."""
         # Resolve aliases before API selection, including Claude-backed aliases.
-        route = self._openai_route(request, provider_id)
+        prepared_model = self._prepared(request, access_policy, prepared_model)
+        route = self._openai_route(request, provider_id, prepared_model)
         if route:
             service, responses, upstream_request = route
             invoke = service.invoke_responses_sync if responses else service.invoke_model_sync
-            result: MessageResponse = invoke(upstream_request, request_id)
+            result: MessageResponse = invoke(upstream_request, request_id, **({"access_policy": access_policy} if access_policy.model_enabled else {}))
             result.model = request.model
             return result
-        if self._is_claude_model(self._get_bedrock_model_id(request.model)):
+        if (prepared_model.api == "native" if prepared_model else self._is_claude_model(self._get_bedrock_model_id(request.model))):
             print(f"[BEDROCK] Using InvokeModel API for Claude model: {request.model}")
-            return self._invoke_model_native_sync(request, request_id, service_tier, anthropic_beta, cache_ttl=cache_ttl, provider_id=provider_id)
+            return self._invoke_model_native_sync(request, request_id, service_tier, anthropic_beta, cache_ttl=cache_ttl, provider_id=provider_id, access_policy=access_policy, prepared_model=prepared_model)
 
         print(f"[BEDROCK] Converting request to Bedrock format for request {request_id}")
 
         # Convert request to Bedrock format (with beta header mapping)
-        bedrock_request = self.anthropic_to_bedrock.convert_request(request, anthropic_beta)
+        bedrock_request = self._converse_request(request, anthropic_beta, prepared_model)
+        require_model(access_policy, bedrock_request["modelId"])
 
         # Determine service tier to use
         effective_service_tier = service_tier or settings.default_service_tier
@@ -997,6 +1093,8 @@ class BedrockService:
                     retry_message = retry_error.response["Error"]["Message"]
                     print(f"[ERROR] Retry with default tier also failed: {retry_code}: {retry_message}")
                     raise map_bedrock_error(retry_code, retry_message)
+                except AccessPolicyDenied:
+                    raise
                 except Exception as retry_error:
                     print(f"[ERROR] Retry with default tier also failed: {retry_error}")
                     raise map_bedrock_error(error_code, error_message)
@@ -1006,7 +1104,7 @@ class BedrockService:
 
         except ParamValidationError as e:
             raise map_bedrock_error("ValidationException", str(e)) from e
-        except BedrockAPIError:
+        except (AccessPolicyDenied, BedrockAPIError):
             # Re-raise our custom exceptions as-is
             raise
         except Exception as e:
@@ -1026,7 +1124,9 @@ class BedrockService:
         self, request: MessageRequest, request_id: Optional[str] = None,
         service_tier: Optional[str] = None,
         anthropic_beta: Optional[str] = None, cache_ttl: Optional[str] = None,
-        provider_id: Optional[str] = None
+        provider_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
+        prepared_model: PreparedModel | None = None,
     ) -> MessageResponse:
         """
         Invoke Bedrock InvokeModel API for Claude models (native Anthropic format).
@@ -1048,7 +1148,8 @@ class BedrockService:
             BedrockAPIError: If Bedrock API call fails
         """
         # Get Bedrock model ID
-        bedrock_model_id = self._get_bedrock_model_id(request.model)
+        bedrock_model_id = prepared_model.target if prepared_model else self._get_bedrock_model_id(request.model)
+        require_model(access_policy, bedrock_model_id)
 
         # Convert request to native Anthropic format
         native_request = self._convert_to_anthropic_native_request(request, anthropic_beta)
@@ -1151,6 +1252,8 @@ class BedrockService:
                     retry_message = retry_error.response["Error"]["Message"]
                     print(f"[ERROR] Retry with default tier also failed: {retry_code}: {retry_message}")
                     raise map_bedrock_error(retry_code, retry_message)
+                except AccessPolicyDenied:
+                    raise
                 except Exception as retry_error:
                     print(f"[ERROR] Retry with default tier also failed: {retry_error}")
                     raise map_bedrock_error(error_code, error_message)
@@ -1158,7 +1261,7 @@ class BedrockService:
             # Map Bedrock error to appropriate exception
             raise map_bedrock_error(error_code, error_message)
 
-        except BedrockAPIError:
+        except (AccessPolicyDenied, BedrockAPIError):
             raise
         except Exception as e:
             print(f"\n[ERROR] Exception in InvokeModel for request {request_id}")
@@ -1256,7 +1359,9 @@ class BedrockService:
     async def invoke_model_stream(
         self, request: MessageRequest, request_id: Optional[str] = None,
         service_tier: Optional[str] = None, anthropic_beta: Optional[str] = None,
-        cache_ttl: Optional[str] = None, provider_id: Optional[str] = None
+        cache_ttl: Optional[str] = None, provider_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
+        prepared_model: PreparedModel | None = None,
     ) -> AsyncGenerator[str, None]:
         """
         Invoke Bedrock model with streaming (Server-Sent Events format).
@@ -1279,12 +1384,13 @@ class BedrockService:
         """
         # Route non-Claude models to OpenAI-compat streaming BEFORE acquiring semaphore
         # (OpenAI-compat service manages its own semaphore)
-        route = self._openai_route(request, provider_id)
+        prepared_model = self._prepared(request, access_policy, prepared_model)
+        route = self._openai_route(request, provider_id, prepared_model)
         if route:
             service, responses, upstream_request = route
             message_id = request_id or f"msg_{uuid4().hex}"
             invoke = service.invoke_responses_stream if responses else service.invoke_model_stream
-            async for event in invoke(upstream_request, message_id):
+            async for event in invoke(upstream_request, message_id, **({"access_policy": access_policy} if access_policy.model_enabled else {})):
                 if upstream_request.model != request.model and event.startswith("event: message_start\n"):
                     payload = json.loads(event.split("data: ", 1)[1])
                     payload["message"]["model"] = request.model
@@ -1313,11 +1419,12 @@ class BedrockService:
             effective_service_tier = service_tier or settings.default_service_tier
 
             # Route Claude models to InvokeModelWithResponseStream for better feature support
-            if self._is_claude_model(self._get_bedrock_model_id(request.model)):
+            if (prepared_model.api == "native" if prepared_model else self._is_claude_model(self._get_bedrock_model_id(request.model))):
                 print(f"[BEDROCK STREAM] Using InvokeModelWithResponseStream for Claude model: {request.model}")
 
                 # Get Bedrock model ID
-                bedrock_model_id = self._get_bedrock_model_id(request.model)
+                bedrock_model_id = prepared_model.target if prepared_model else self._get_bedrock_model_id(request.model)
+                require_model(access_policy, bedrock_model_id)
 
                 # Convert request to native Anthropic format
                 native_request = self._convert_to_anthropic_native_request(request, anthropic_beta)
@@ -1347,13 +1454,14 @@ class BedrockService:
                     effective_service_tier,
                     event_queue,
                     _otel_ctx,
-                    provider_id
+                    provider_id,
+                    access_policy,
                 )
             else:
                 print(f"[BEDROCK STREAM] Converting request to Bedrock format for request {request_id}")
 
                 # Convert request to Bedrock format (with beta header mapping)
-                bedrock_request = self.anthropic_to_bedrock.convert_request(request, anthropic_beta)
+                bedrock_request = self._converse_request(request, anthropic_beta, prepared_model)
 
                 print(f"[BEDROCK STREAM] Bedrock request params:")
                 print(f"  - Model ID: {bedrock_request.get('modelId')}")
@@ -1374,7 +1482,8 @@ class BedrockService:
                     effective_service_tier,
                     event_queue,
                     _otel_ctx,
-                    provider_id
+                    provider_id,
+                    access_policy,
                 )
 
             # Consume events from queue asynchronously
@@ -1461,7 +1570,8 @@ class BedrockService:
         effective_service_tier: str,
         event_queue: queue.Queue,
         otel_ctx=None,
-        provider_id: Optional[str] = None
+        provider_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
     ) -> None:
         """
         Worker function that runs in thread pool to handle streaming.
@@ -1499,6 +1609,9 @@ class BedrockService:
             )
             bedrock_request = adapter.request
             print(f"[BEDROCK STREAM WORKER] Calling Bedrock ConverseStream API...")
+
+            # Guard inside the worker as well as the async preflight.
+            require_model(access_policy, bedrock_request["modelId"])
 
             def invoke_stream():
                 client = self.get_client(provider_id)
@@ -1586,6 +1699,8 @@ class BedrockService:
 
             event_queue.put(("error", (error_code, error_message)))
 
+        except AccessPolicyDenied as e:
+            event_queue.put(("error", ("AccessDeniedException", str(e))))
         except ParamValidationError as e:
             event_queue.put(("error", ("ValidationException", str(e))))
         except BedrockAPIError as e:
@@ -1609,7 +1724,8 @@ class BedrockService:
         effective_service_tier: str,
         event_queue: queue.Queue,
         otel_ctx=None,
-        provider_id: Optional[str] = None
+        provider_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
     ) -> None:
         """
         Worker function for InvokeModelWithResponseStream (native Anthropic format).
@@ -1648,6 +1764,7 @@ class BedrockService:
             if effective_service_tier and effective_service_tier != "default":
                 invoke_kwargs["serviceTier"] = effective_service_tier
 
+            require_model(access_policy, bedrock_model_id)
             # Call InvokeModelWithResponseStream API
             response = self.get_client(provider_id).invoke_model_with_response_stream(**invoke_kwargs)
 
@@ -1672,6 +1789,8 @@ class BedrockService:
                         # Parse the event data
                         event_data = json.loads(chunk_bytes.decode("utf-8"))
                         event_type = event_data.get("type", "unknown")
+                        if access_policy.model_enabled and event_type == "message_start":
+                            event_data["message"]["model"] = _request.model
 
                         # Format as SSE and put in queue
                         sse_event = f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
@@ -1721,6 +1840,8 @@ class BedrockService:
                                 if chunk_bytes:
                                     event_data = json.loads(chunk_bytes.decode("utf-8"))
                                     event_type = event_data.get("type", "unknown")
+                                    if access_policy.model_enabled and event_type == "message_start":
+                                        event_data["message"]["model"] = _request.model
                                     sse_event = f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
                                     event_queue.put(("event", sse_event))
 
@@ -1732,6 +1853,8 @@ class BedrockService:
 
             event_queue.put(("error", (error_code, error_message)))
 
+        except AccessPolicyDenied as e:
+            event_queue.put(("error", ("AccessDeniedException", str(e))))
         except Exception as e:
             print(f"[ERROR] Exception in native stream worker: {type(e).__name__}: {e}")
             import traceback
@@ -1994,7 +2117,9 @@ class BedrockService:
         except Exception as e:
             raise Exception(f"Failed to get model info: {str(e)}")
 
-    async def count_tokens(self, request: CountTokensRequest, provider_id: Optional[str] = None) -> int:
+    async def count_tokens(self, request: CountTokensRequest, provider_id: Optional[str] = None,
+                           access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
+                           prepared_model: PreparedModel | None = None) -> int:
         """
         Count tokens in a request asynchronously.
 
@@ -2012,6 +2137,11 @@ class BedrockService:
             For Claude models on Bedrock, this returns actual token counts.
             For other models, this returns an estimation.
         """
+        # Authorization precedes even local estimation and its fallback handler.
+        if prepared_model is None and access_policy.model_enabled:
+            prepared_model = self.prepare_count_model(request.model, access_policy)
+        if prepared_model is not None:
+            require_model(access_policy, prepared_model.target)
         # Check if this is an Anthropic/Claude model
         model_id = request.model.lower()
         is_claude_model = (
@@ -2029,8 +2159,12 @@ class BedrockService:
                     executor,
                     self._count_tokens_sync,
                     request,
-                    provider_id
+                    provider_id,
+                    access_policy,
+                    prepared_model,
                 )
+            except AccessPolicyDenied:
+                raise
             except Exception as e:
                 # If Bedrock API fails, fall back to estimation
                 pass
@@ -2038,7 +2172,9 @@ class BedrockService:
         # Fallback: Estimate token count for non-Claude models or if API fails
         return self._estimate_token_count(request)
 
-    def _count_tokens_sync(self, request: CountTokensRequest, provider_id: Optional[str] = None) -> int:
+    def _count_tokens_sync(self, request: CountTokensRequest, provider_id: Optional[str] = None,
+                           access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
+                           prepared_model: PreparedModel | None = None) -> int:
         """
         Synchronous count tokens implementation (runs in thread pool).
 
@@ -2057,8 +2193,10 @@ class BedrockService:
             max_tokens=1,  # Required but not used for counting
         )
 
-        # Convert to Bedrock format
-        bedrock_request = self.anthropic_to_bedrock.convert_request(message_request)
+        if prepared_model is None and access_policy.model_enabled:
+            prepared_model = self.prepare_count_model(request.model, access_policy)
+        bedrock_request = self._converse_request(message_request, None, prepared_model)
+        require_model(access_policy, bedrock_request["modelId"])
 
         # Build count_tokens API request
         count_tokens_input = {

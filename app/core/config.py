@@ -8,8 +8,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.core.client_ip import ClientIPTrust
 
 
 # Offline snapshot of the default model mapping: the ``model-mappings`` git
@@ -63,7 +65,9 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # Server Settings
-    host: str = Field(default="0.0.0.0", alias="HOST")
+    # Loopback by default for local runs. Containers bind 0.0.0.0 explicitly
+    # (Dockerfile CMD / docker-compose HOST), where the published port is the boundary.
+    host: str = Field(default="127.0.0.1", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
     workers: int = Field(default=1, alias="WORKERS")
     reload: bool = Field(default=False, alias="RELOAD")
@@ -172,6 +176,34 @@ class Settings(BaseSettings):
             "this long to apply on running workers."
         )
     )
+
+    # Source attribution: raw ASGI peer, never Uvicorn proxy-header rewriting.
+    client_ip_trusted_proxy_cidrs: str = Field(
+        default="",
+        alias="CLIENT_IP_TRUSTED_PROXY_CIDRS",
+        description="Comma-separated ingress peer/subnet CIDRs; empty for direct mode",
+    )
+    client_ip_trusted_proxy_hops: int = Field(
+        default=0,
+        alias="CLIENT_IP_TRUSTED_PROXY_HOPS",
+        description="Fixed appended hops: 0 direct, 1 ALB, 2 enforced CloudFront+ALB",
+    )
+
+    @field_validator("client_ip_trusted_proxy_hops", mode="before")
+    @classmethod
+    def strict_proxy_hops(cls, value: Any) -> int:
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            value = int(value)
+        if type(value) is not int:
+            raise ValueError("Proxy hop count must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def validate_client_ip_trust(self) -> "Settings":
+        ClientIPTrust.from_config(
+            self.client_ip_trusted_proxy_cidrs, self.client_ip_trusted_proxy_hops
+        )
+        return self
 
     # Rate Limiting Settings
     rate_limit_enabled: bool = Field(default=True, alias="RATE_LIMIT_ENABLED")
@@ -528,6 +560,15 @@ class Settings(BaseSettings):
         alias="IMAGE_URL_FETCH_MAX_BYTES",
         description="Maximum bytes to download per image URL (Bedrock applies its own stricter limits downstream)"
     )
+    image_url_fetch_allow_private_networks: bool = Field(
+        default=False,
+        alias="IMAGE_URL_FETCH_ALLOW_PRIVATE_NETWORKS",
+        description=(
+            "Allow image URL sources that resolve to private, loopback, link-local or "
+            "cloud-metadata addresses. Off by default (SSRF protection); enable only if "
+            "clients must reference images on internal hosts and egress is otherwise restricted."
+        ),
+    )
 
     # === OpenAI-Compatible API Settings (Bedrock Runtime and Mantle) ===
     enable_bedrock_responses: bool = Field(
@@ -596,7 +637,7 @@ class Settings(BaseSettings):
     pricing_sync_url: str = Field(
         default=(
             "https://raw.githubusercontent.com/BerriAI/litellm/"
-            "litellm_internal_staging/model_prices_and_context_window.json"
+            "main/model_prices_and_context_window.json"
         ),
         alias="PRICING_SYNC_URL",
         description="URL of the LiteLLM model_prices_and_context_window.json to sync from"

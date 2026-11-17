@@ -30,6 +30,12 @@ from app.converters.openai_responses_to_anthropic import (
     OpenAIResponsesToAnthropicConverter,
 )
 from app.converters.openai_to_anthropic import OpenAIToAnthropicConverter
+from app.core.access_policy import (
+    UNRESTRICTED_POLICY,
+    AccessPolicyDenied,
+    ParsedAccessPolicy,
+    require_model,
+)
 from app.core.config import settings
 from app.core.exceptions import BedrockAPIError
 from app.schemas.anthropic import MessageRequest, MessageResponse
@@ -112,7 +118,10 @@ class OpenAICompatService:
         print(f"[OPENAI-COMPAT] Initialized with endpoint={endpoint_source}")
 
     def invoke_model_sync(
-        self, request: MessageRequest, request_id: Optional[str] = None
+        self,
+        request: MessageRequest,
+        request_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
     ) -> MessageResponse:
         """Synchronously invoke a model via OpenAI Chat Completions API.
 
@@ -127,6 +136,7 @@ class OpenAICompatService:
 
         # Convert Anthropic request to OpenAI format
         openai_request = self.request_converter.convert_request(request)
+        require_model(access_policy, openai_request["model"])
         openai_request["stream"] = False
 
         # Extract extra_body (not a standard create() parameter, passed separately)
@@ -251,7 +261,10 @@ class OpenAICompatService:
             raise
 
     async def invoke_model(
-        self, request: MessageRequest, request_id: Optional[str] = None
+        self,
+        request: MessageRequest,
+        request_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
     ) -> MessageResponse:
         """Asynchronously invoke a model via OpenAI Chat Completions API.
 
@@ -274,6 +287,7 @@ class OpenAICompatService:
                 self.invoke_model_sync,
                 request,
                 request_id,
+                access_policy,
             )
 
     # bedrock-mantle serves gpt-5.x on /openai/v1 and the open-weight gpt-oss family on /v1. When ENABLE_OPENAI_COMPAT
@@ -308,7 +322,10 @@ class OpenAICompatService:
         return self.client
 
     def invoke_responses_sync(
-        self, request: MessageRequest, request_id: Optional[str] = None
+        self,
+        request: MessageRequest,
+        request_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
     ) -> MessageResponse:
         """Synchronously invoke a model via OpenAI Responses API.
 
@@ -324,6 +341,7 @@ class OpenAICompatService:
             MessageResponse in Anthropic format.
         """
         kwargs = self.responses_request_converter.convert_request(request)
+        require_model(access_policy, kwargs["model"])
         kwargs["stream"] = False
 
         print(f"[OPENAI-COMPAT-RESPONSES] Calling Responses API")
@@ -386,7 +404,10 @@ class OpenAICompatService:
             raise
 
     async def invoke_responses(
-        self, request: MessageRequest, request_id: Optional[str] = None
+        self,
+        request: MessageRequest,
+        request_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
     ) -> MessageResponse:
         """Asynchronously invoke a model via OpenAI Responses API.
 
@@ -410,10 +431,14 @@ class OpenAICompatService:
                 self.invoke_responses_sync,
                 request,
                 request_id,
+                access_policy,
             )
 
     async def invoke_responses_stream(
-        self, request: MessageRequest, request_id: str | None = None
+        self,
+        request: MessageRequest,
+        request_id: str | None = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
     ) -> AsyncGenerator[str, None]:
         """Translate live Responses events using a bounded thread/async bridge.
 
@@ -451,6 +476,7 @@ class OpenAICompatService:
                 if cancelled.is_set():
                     return
                 kwargs = self.responses_request_converter.convert_request(request)
+                require_model(access_policy, kwargs["model"])
                 kwargs["stream"] = True
                 stream = self._responses_client(request.model).responses.create(**kwargs)
                 with stream_lock:
@@ -480,6 +506,8 @@ class OpenAICompatService:
                         404: "not_found_error",
                         429: "rate_limit_error",
                     }.get(exc.status_code, "api_error")
+                elif isinstance(exc, AccessPolicyDenied):
+                    error_type = "permission_error"
                 elif isinstance(exc, BedrockAPIError):
                     error_type = exc.error_type
                 put(
@@ -536,7 +564,10 @@ class OpenAICompatService:
                 pass
 
     async def invoke_model_stream(
-        self, request: MessageRequest, request_id: Optional[str] = None
+        self,
+        request: MessageRequest,
+        request_id: Optional[str] = None,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
     ) -> AsyncGenerator[str, None]:
         """Stream a model response via OpenAI Chat Completions API.
 
@@ -564,6 +595,7 @@ class OpenAICompatService:
                 request,
                 message_id,
                 event_queue,
+                access_policy,
             )
 
             # Consume events from queue asynchronously
@@ -651,6 +683,7 @@ class OpenAICompatService:
         request: MessageRequest,
         message_id: str,
         event_queue: queue.Queue,
+        access_policy: ParsedAccessPolicy = UNRESTRICTED_POLICY,
     ) -> None:
         """Worker function that runs in thread pool to handle streaming.
 
@@ -665,6 +698,7 @@ class OpenAICompatService:
         try:
             # Convert request with streaming enabled
             openai_request = self.request_converter.convert_request(request)
+            require_model(access_policy, openai_request["model"])
             openai_request["stream"] = True
             openai_request["stream_options"] = {"include_usage": True}
 
@@ -994,6 +1028,8 @@ class OpenAICompatService:
 
             event_queue.put(("done", None))
 
+        except AccessPolicyDenied as e:
+            event_queue.put(("error", ("403", str(e))))
         except OpenAIError as e:
             print(f"[OPENAI-COMPAT STREAM] OpenAI API error: {e}")
             status_code = getattr(e, "status_code", 500)

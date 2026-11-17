@@ -21,6 +21,9 @@ export interface EnvironmentConfig {
   // VPC Configuration
   vpcCidr: string;
   maxAzs: number;
+  // Keep the subnet CIDRs of a VPC that was created with maxAzs=3 after
+  // shrinking it to 2 AZs (VPC_LEGACY_3AZ_CIDRS=true). See network-stack.ts.
+  vpcLegacy3AzCidrs?: boolean;
 
   // ECS Configuration
   ecsDesiredCount: number;
@@ -94,7 +97,7 @@ export interface EnvironmentConfig {
   enableOpenaiCompat: boolean;
   enableBedrockResponses?: boolean;         // Scoped non-Claude IDs use Runtime by default
   enableOpenaiPassthrough: boolean;          // Mount /openai/v1/* passthrough endpoints
-  openaiBaseUrl?: string;                    // e.g., https://bedrock-mantle.us-east-1.api.aws/v1
+  openaiBaseUrl?: string;                    // default: https://bedrock-runtime.<region>.amazonaws.com/openai/v1
 
   // Admin Portal Configuration
   adminPortalEnabled: boolean;
@@ -115,7 +118,7 @@ export interface EnvironmentConfig {
   enableContainerInsights: boolean;
 
   // CloudFront Configuration
-  enableCloudFront: boolean;            // Enable CloudFront distribution with HTTPS
+  enableCloudFront: boolean;            // CloudFront HTTPS + internal ALB via VPC origin (false = public plain-HTTP ALB, testing only)
   cloudFrontOriginReadTimeout: number;  // Origin read timeout in seconds (up to 120 self-service; higher via AWS quota increase)
   cloudFrontDomainName?: string;        // Custom domain (alternate domain name), e.g. bedrock-api.example.com
   cloudFrontCertificateArn?: string;    // ACM cert ARN covering the custom domain — MUST be in us-east-1
@@ -126,6 +129,15 @@ export interface EnvironmentConfig {
 
 // Environment configurations without runtime settings (platform and launchType are set at deployment time)
 type EnvironmentConfigWithoutRuntime = Omit<EnvironmentConfig, 'platform' | 'launchType'>;
+
+/**
+ * Bedrock Runtime's OpenAI-compatible base URL for a region. The proxy signs
+ * these calls with the task role (SigV4), so no Bedrock API key is needed.
+ */
+export function bedrockRuntimeOpenaiUrl(region: string): string {
+  const suffix = region.startsWith('cn-') ? 'amazonaws.com.cn' : 'amazonaws.com';
+  return `https://bedrock-runtime.${region}.${suffix}/openai/v1`;
+}
 
 const baseEnvironments: { [key: string]: EnvironmentConfigWithoutRuntime } = {
   dev: {
@@ -208,10 +220,10 @@ const baseEnvironments: { [key: string]: EnvironmentConfigWithoutRuntime } = {
     // needs the Anthropic surface. Turn on with ENABLE_OPENAI_PASSTHROUGH=true.
     enableOpenaiCompat: false,
     enableOpenaiPassthrough: false,
-    // Upstream Mantle base URL (see the prod block: the proxy switches between
-    // /openai/v1 and /v1 per model). Override with MANTLE_ENDPOINT_URL to point
-    // a dev deploy at a different region.
-    openaiBaseUrl: 'https://bedrock-mantle.us-west-2.api.aws/openai/v1',
+    // Upstream OpenAI-compatible base URL: Bedrock Runtime in the deploy
+    // region, authenticated with the task role (no API key). Override with
+    // MANTLE_ENDPOINT_URL only for a custom endpoint.
+    openaiBaseUrl: bedrockRuntimeOpenaiUrl(process.env.AWS_REGION || 'us-west-2'),
 
     // Admin Portal
     adminPortalEnabled: true,
@@ -321,18 +333,14 @@ const baseEnvironments: { [key: string]: EnvironmentConfigWithoutRuntime } = {
     // otelTraceSamplingRatio: 0.1,
 
     // OpenAI-Compatible API (Bedrock Mantle)
-    // Opt-in — see the dev block. Enable with ENABLE_OPENAI_PASSTHROUGH=true
-    // (a Bedrock API key is then required).
+    // Opt-in — see the dev block. Enable with ENABLE_OPENAI_PASSTHROUGH=true.
     enableOpenaiCompat: false,
     enableOpenaiPassthrough: false,
-    // Upstream Mantle base URL. `/openai/v1` serves the OpenAI GPT-5.x family
-    // and is the documented path for them; the open-weight gpt-oss models are
-    // served from `/v1` instead. The proxy rewrites the path per request based
-    // on the model id (see upstream_url in client.py), so this default only
-    // sets the host and the GPT-5.x path.
+    // Upstream OpenAI-compatible base URL: Bedrock Runtime (/openai/v1) in the
+    // deploy region, signed with the task role, so no API key is needed.
     // Leaving it unset produces a scheme-less URL and a 502, which is why
     // validateConfig() rejects that combination.
-    openaiBaseUrl: 'https://bedrock-mantle.us-east-2.api.aws/openai/v1',
+    openaiBaseUrl: bedrockRuntimeOpenaiUrl(process.env.AWS_REGION || 'us-east-1'),
 
     // Admin Portal
     adminPortalEnabled: true,
@@ -496,6 +504,9 @@ export function getConfig(environmentName: string = 'dev'): EnvironmentConfig {
     enableOpenaiCompat,
     enableOpenaiPassthrough,
     enableCloudFront,
+    ...(process.env.VPC_LEGACY_3AZ_CIDRS && {
+      vpcLegacy3AzCidrs: process.env.VPC_LEGACY_3AZ_CIDRS.toLowerCase() === 'true',
+    }),
     ...((process.env.MANTLE_ENDPOINT_URL || process.env.OPENAI_BASE_URL) && {
       openaiBaseUrl: process.env.MANTLE_ENDPOINT_URL || process.env.OPENAI_BASE_URL,
     }),
@@ -562,9 +573,10 @@ export function validateConfig(config: EnvironmentConfig, environmentName: strin
   const usesRuntimeEndpoint = /^https:\/\/bedrock-runtime\.[a-z0-9-]+\.(amazonaws\.com(?:\.cn)?|api\.aws)(?:\/|$)/.test(config.openaiBaseUrl || '');
   if (needsMantleEndpoint && !usesRuntimeEndpoint && !hasBedrockApiKey) {
     errors.push(
-      `openaiCompat/openaiPassthrough is enabled but no Bedrock API key is available. ` +
-      `Export BEDROCK_API_KEY for this deploy. Without it the proxy sends ` +
-      `'Authorization: Bearer ' with an empty token and Mantle rejects every request.`
+      `openaiCompat/openaiPassthrough points at a non-Runtime endpoint ` +
+      `(${config.openaiBaseUrl}) but no Bedrock API key is available. Unset ` +
+      `MANTLE_ENDPOINT_URL to use Bedrock Runtime with task-role SigV4, or export ` +
+      `BEDROCK_API_KEY. Without either, every upstream request is rejected.`
     );
   }
 
